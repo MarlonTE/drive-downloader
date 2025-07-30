@@ -8,6 +8,7 @@ from bs4 import BeautifulSoup # Import BeautifulSoup for HTML parsing
 import argparse
 import logging
 from logging.handlers import RotatingFileHandler
+import hashlib # For SHA256 hash calculation
 
 # --- Configuration ---
 DOWNLOAD_FOLDER = "drive_downloads"  # Folder where files will be saved
@@ -27,13 +28,8 @@ console_handler = logging.StreamHandler()
 console_handler.setFormatter(logging.Formatter('%(levelname)s: %(message)s'))
 logger.addHandler(console_handler)
 
-# File handler (rotating log file)
-# This path will be updated in main() after DOWNLOAD_FOLDER is ensured to exist
-log_file_path = os.path.join(DOWNLOAD_FOLDER, "downloads.log")
-file_handler = RotatingFileHandler(log_file_path, maxBytes=5*1024*1024, backupCount=5) # 5MB per file, 5 backups
-file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
-logger.addHandler(file_handler)
-
+# --- Check for psutil availability and define PSUTIL_AVAILABLE globally ---
+# This block ensures PSUTIL_AVAILABLE is always defined, preventing NameError.
 try:
     import psutil
     PSUTIL_AVAILABLE = True
@@ -44,23 +40,60 @@ except ImportError:
 
 # --- Helper Functions ---
 
-def extract_file_id(url):
+def extract_file_id(url: str) -> str | None:
     """
     Extracts the FILEID from a Google Drive URL.
-    Supports formats like:
-    - https://drive.google.com/file/d/FILEID/view
-    - https://drive.google.com/open?id=FILEID
-    - https://drive.google.com/uc?export=download&id=FILEID
+
+    Args:
+        url (str): The Google Drive URL.
+
+    Returns:
+        str | None: The extracted FILEID if found, otherwise None.
     """
     match = re.search(r'(?:id=|\/d\/)([a-zA-Z0-9_-]+)', url)
     if match:
         return match.group(1)
     return None
 
-def download_file_from_google_drive(file_id, output_path, max_retries, chunk_size):
+def calculate_sha256(file_path: str, chunk_size: int = DEFAULT_CHUNK_SIZE) -> str | None:
+    """
+    Calculates the SHA256 hash of a file.
+
+    Args:
+        file_path (str): The path to the file.
+        chunk_size (int): The size of chunks to read the file in.
+
+    Returns:
+        str | None: The SHA256 hash of the file in hexadecimal format, or None if an error occurs.
+    """
+    sha256_hash = hashlib.sha256()
+    try:
+        with open(file_path, "rb") as f:
+            for byte_block in iter(lambda: f.read(chunk_size), b""):
+                sha256_hash.update(byte_block)
+        return sha256_hash.hexdigest()
+    except Exception as e:
+        logger.error(f"Error calculating SHA256 for {file_path}: {e}")
+        return None
+
+def download_file_from_google_drive(file_id: str, output_path: str, max_retries: int, chunk_size: int) -> tuple[bool, str, int, float, str]:
     """
     Downloads a file from Google Drive, handling large file confirmation,
     exponential retries, and logging download timing and speed.
+
+    Args:
+        file_id (str): The ID of the Google Drive file.
+        output_path (str): The directory where the file will be saved.
+        max_retries (int): Maximum number of retry attempts.
+        chunk_size (int): Size of chunks for streaming download.
+
+    Returns:
+        tuple[bool, str, int, float, str]: A tuple containing:
+            - bool: True if download was successful or skipped, False otherwise.
+            - str: The determined file name.
+            - int: Total size of the file in bytes.
+            - float: Start time of the download process (time.time()).
+            - str: Status of the download ("Success", "Skipped", "Failed", "Failed (Quota Exceeded)", etc.).
     """
     download_url = f"https://drive.google.com/uc?export=download&id={file_id}"
     session = requests.Session()
@@ -68,7 +101,7 @@ def download_file_from_google_drive(file_id, output_path, max_retries, chunk_siz
     start_time = time.time()
     file_name = f"{file_id}.bin" # Default name, will be updated if Content-Disposition is found
     total_size = 0
-    status = "Failed" # Default status
+    status = "Failed" # Default status for early exit scenarios
 
     for retry_count in range(max_retries + 1):
         try:
@@ -78,9 +111,7 @@ def download_file_from_google_drive(file_id, output_path, max_retries, chunk_siz
             response = session.get(download_url, stream=True, timeout=30)
             response.raise_for_status()  # Raises an exception for bad HTTP status codes
 
-            # --- Detect and handle Google Drive virus scan warning page ---
-            # Google returns an HTML warning page for files > 100MB
-            # that have not been scanned for viruses, or other error pages.
+            # --- Detect and handle Google Drive HTML responses (warning page or error) ---
             if 'Content-Type' in response.headers and 'text/html' in response.headers['Content-Type']:
                 logger.info(f"Detected Google Drive HTML response for {file_id}. Checking for confirmation form or error messages.")
                 
@@ -132,11 +163,8 @@ def download_file_from_google_drive(file_id, output_path, max_retries, chunk_siz
                         logger.warning(f"HTML page detected for {file_id}, but no download form or specific quota/virus warning text was found. This might indicate a change in Google Drive's warning page or an access issue.")
                         raise requests.exceptions.RequestException("Download form not found or unrecognized HTML warning page.")
 
-            # --- Continue with normal download flow ---
-            # Get the file name from headers or use the file_id
+            # --- Determine file name before checking for existence ---
             if 'Content-Disposition' in response.headers:
-                # Attempt to extract the file name from Content-Disposition,
-                # which is the preferred method for getting the original name.
                 fname_match = re.search(r'filename\*?=UTF-8\'\'(.+)', response.headers['Content-Disposition'])
                 if fname_match:
                     file_name = requests.utils.unquote(fname_match.group(1))
@@ -144,8 +172,21 @@ def download_file_from_google_drive(file_id, output_path, max_retries, chunk_siz
                     fname_match = re.search(r'filename="([^"]+)"', response.headers['Content-Disposition'])
                     if fname_match:
                         file_name = fname_match.group(1)
+            
+            # Use a sanitized file name for path construction
+            sanitized_file_name = "".join([c for c in file_name if c.isalnum() or c in ('.', '_', '-')])
+            if not sanitized_file_name: # Fallback if sanitization makes it empty
+                sanitized_file_name = file_name
+            
+            full_output_path = os.path.join(output_path, sanitized_file_name)
 
-            full_output_path = os.path.join(output_path, file_name)
+            # --- Check if file already exists and skip if so ---
+            if os.path.exists(full_output_path) and os.path.getsize(full_output_path) > 0:
+                status = "Skipped"
+                logger.info(f"File '{sanitized_file_name}' already exists in '{output_path}'. Skipping download.")
+                return True, sanitized_file_name, os.path.getsize(full_output_path), start_time, status
+
+            # --- Continue with normal download flow ---
             total_size = int(response.headers.get('content-length', 0))
 
             downloaded_bytes = 0
@@ -155,7 +196,7 @@ def download_file_from_google_drive(file_id, output_path, max_retries, chunk_siz
 
             with open(full_output_path, 'wb') as f:
                 # Use tqdm to show a download progress bar
-                with tqdm(total=total_size, unit='B', unit_scale=True, desc=file_name) as pbar:
+                with tqdm(total=total_size, unit='B', unit_scale=True, desc=sanitized_file_name) as pbar:
                     for chunk in response.iter_content(chunk_size=chunk_size):
                         if chunk:
                             f.write(chunk)
@@ -173,7 +214,7 @@ def download_file_from_google_drive(file_id, output_path, max_retries, chunk_siz
                                     if low_throughput_start_time is None:
                                         low_throughput_start_time = current_time
                                     elif current_time - low_throughput_start_time >= LOW_THROUGHPUT_TIMEOUT:
-                                        logger.warning(f"Low throughput detected for '{file_name}' ({current_throughput:.2f} B/s). Download might be slow or stuck.")
+                                        logger.warning(f"Low throughput detected for '{sanitized_file_name}' ({current_throughput:.2f} B/s). Download might be slow or stuck.")
                                         # Reset low_throughput_start_time to avoid repeated warnings for the same continuous low throughput
                                         low_throughput_start_time = current_time 
                                 else:
@@ -181,9 +222,17 @@ def download_file_from_google_drive(file_id, output_path, max_retries, chunk_siz
 
                                 last_throughput_check_time = current_time
                                 bytes_since_last_check = 0
+            
+            # --- Calculate SHA256 hash after successful download ---
+            sha256_hash = calculate_sha256(full_output_path, chunk_size)
+            if sha256_hash:
+                sha256_file_path = f"{full_output_path}.sha256"
+                with open(sha256_file_path, 'w') as f:
+                    f.write(sha256_hash)
+                logger.info(f"SHA256 hash calculated and saved for '{sanitized_file_name}': {sha256_hash}")
 
             status = "Success"
-            return True, file_name, total_size, start_time, status
+            return True, sanitized_file_name, total_size, start_time, status
 
         except (requests.exceptions.RequestException, requests.exceptions.Timeout) as e:
             # Handle network errors, HTTP errors, and timeouts with exponential retries
@@ -208,6 +257,10 @@ def download_file_from_google_drive(file_id, output_path, max_retries, chunk_siz
 # --- Main Function ---
 
 def main():
+    """
+    Main function to parse arguments, read links, and manage the download process.
+    Handles parallel downloads, logging, and graceful shutdown.
+    """
     parser = argparse.ArgumentParser(description="Google Drive Downloader Script.")
     parser.add_argument("--workers", type=int, default=DEFAULT_MAX_PARALLEL_DOWNLOADS,
                         help=f"Number of parallel download threads (default: {DEFAULT_MAX_PARALLEL_DOWNLOADS}).")
@@ -215,14 +268,17 @@ def main():
                         help=f"Chunk size in bytes for streaming downloads (default: {DEFAULT_CHUNK_SIZE} bytes).")
     parser.add_argument("--retries", type=int, default=DEFAULT_MAX_RETRIES,
                         help=f"Maximum number of retries per download (default: {DEFAULT_MAX_RETRIES}).")
+    parser.add_argument("--input-file", type=str,
+                        help="Path to a text file containing Google Drive links (one link per line).")
     args = parser.parse_args()
 
-    # Ensure the download folder exists
+    # --- Ensure the download folder exists before configuring the logger ---
+    # This prevents FileNotFoundError when setting up RotatingFileHandler if the folder doesn't exist.
     os.makedirs(DOWNLOAD_FOLDER, exist_ok=True)
     
-    # Set up logging to the download folder
+    # Reconfigure file handler with the correct path after folder creation
     log_file_path = os.path.join(DOWNLOAD_FOLDER, "downloads.log")
-    for handler in logger.handlers: # Remove existing file handler if any, to re-add with correct path
+    for handler in logger.handlers:
         if isinstance(handler, RotatingFileHandler):
             logger.removeHandler(handler)
     file_handler = RotatingFileHandler(log_file_path, maxBytes=5*1024*1024, backupCount=5)
@@ -243,18 +299,23 @@ def main():
     
     # Read links from a text file or in-memory list
     drive_links = []
-    input_choice = input("Do you want to enter links from a text file (f) or directly here (m)? [f/m]: ").lower()
-
-    if input_choice == 'f':
-        file_path = input("Enter the path to the text file with links (one link per line): ")
+    if args.input_file:
+        file_path = args.input_file
+        # Validate input file existence and readability
+        if not os.path.exists(file_path):
+            logger.error(f"Error: Input file '{file_path}' not found. Please provide a valid path.")
+            return
+        if not os.access(file_path, os.R_OK):
+            logger.error(f"Error: Input file '{file_path}' is not readable. Check permissions.")
+            return
         try:
             with open(file_path, 'r') as f:
                 drive_links = [line.strip() for line in f if line.strip()]
             logger.info(f"Loaded {len(drive_links)} links from '{file_path}'.")
-        except FileNotFoundError:
-            logger.error(f"Error: The file '{file_path}' was not found.")
+        except Exception as e:
+            logger.error(f"Error reading input file '{file_path}': {e}")
             return
-    elif input_choice == 'm':
+    else:
         print("Enter Google Drive links (one per line). Press Enter twice to finish:")
         while True:
             link = input()
@@ -262,25 +323,24 @@ def main():
                 break
             drive_links.append(link.strip())
         logger.info(f"Entered {len(drive_links)} links.")
-    else:
-        logger.error("Invalid option. Exiting.")
-        return
 
     if not drive_links:
-        logger.info("No links provided for download. Exiting.")
+        logger.error("No links provided for download. Exiting.")
         return
 
-    # Process links
+    # Process links and validate FILEIDs
     download_tasks = []
+    valid_links_found = False
     for link in drive_links:
         file_id = extract_file_id(link)
         if file_id:
             download_tasks.append((file_id, DOWNLOAD_FOLDER, args.retries, args.chunk_size))
+            valid_links_found = True
         else:
             logger.warning(f"Could not extract FILEID from URL: {link}. It will be skipped.")
 
-    if not download_tasks:
-        logger.info("No valid FILEIDs found for download. Exiting.")
+    if not valid_links_found:
+        logger.error("No valid Google Drive FILEIDs found in the provided input. Exiting.")
         return
 
     # Download in parallel if configured
@@ -301,7 +361,7 @@ def main():
                         avg_speed = (total_size / duration) if duration > 0 else 0 # bytes/sec
 
                         log_message = (
-                            f"Download Finished: '{file_name}' | Status: {status} | "
+                            f"Download Finished: ID={file_id} | Name='{file_name}' | Status: {status} | "
                             f"Duration: {duration:.2f}s | Size: {total_size} bytes | "
                             f"Avg Speed: {avg_speed / 1024:.2f} KB/s"
                         )
@@ -327,7 +387,7 @@ def main():
                             avg_speed = (total_size / duration) if duration > 0 else 0
 
                             log_message = (
-                                f"Download Finished (Interrupted): '{file_name}' | Status: {status} | "
+                                f"Download Finished (Interrupted): ID={file_id} | Name='{file_name}' | Status: {status} | "
                                 f"Duration: {duration:.2f}s | Size: {total_size} bytes | "
                                 f"Avg Speed: {avg_speed / 1024:.2f} KB/s"
                             )
@@ -357,7 +417,7 @@ def main():
                 avg_speed = (total_size / duration) if duration > 0 else 0
 
                 log_message = (
-                    f"Download Finished: '{file_name}' | Status: {status} | "
+                    f"Download Finished: ID={task[0]} | Name='{file_name}' | Status: {status} | "
                     f"Duration: {duration:.2f}s | Size: {total_size} bytes | "
                     f"Avg Speed: {avg_speed / 1024:.2f} KB/s"
                 )

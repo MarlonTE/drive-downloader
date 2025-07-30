@@ -69,7 +69,8 @@ def is_valid_drive_link(url: str) -> bool:
     """
     # Patterns for common Google Drive share/download links
     drive_patterns = [
-        r'https?:\/\/drive\.google\.com\/file\/d\/[a-zA-Z0-9_-]+\/view',
+        # Made /view optional for links like https://drive.google.com/file/d/FILE_ID
+        r'https?:\/\/drive\.google\.com\/file\/d\/[a-zA-Z0-9_-]+(?:\/view)?',
         r'https?:\/\/drive\.google\.com\/open\?id=[a-zA-Z0-9_-]+',
         r'https?:\/\/drive\.google\.com\/uc\?export=download&id=[a-zA-Z0-9_-]+'
     ]

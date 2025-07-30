@@ -207,7 +207,23 @@ def download_file_from_google_drive(file_id: str, output_path: str, max_retries:
             if not sanitized_file_name: # Fallback if sanitization makes it empty
                 sanitized_file_name = file_name # Use original if sanitized is empty, might cause issues but better than no name
             
-            full_output_path = os.path.join(output_path, sanitized_file_name)
+            # 🔧 Mejora 1: Validación más robusta del nombre de archivo
+            # Asegura que el nombre de archivo sea único en la carpeta de descarga
+            base_name, ext = os.path.splitext(sanitized_file_name)
+            unique_file_name = sanitized_file_name
+            
+            # Si el nombre de archivo ya existe o es genérico/vacío, añade el file_id para asegurar unicidad.
+            # Se añade un contador si incluso con el file_id el nombre sigue existiendo (caso muy raro).
+            counter = 0
+            while os.path.exists(os.path.join(output_path, unique_file_name)):
+                if counter == 0: # Primera vez que se detecta un conflicto, añade el file_id
+                    unique_file_name = f"{base_name}_{file_id}{ext}"
+                else: # Si sigue habiendo conflicto, añade un contador adicional
+                    unique_file_name = f"{base_name}_{file_id}_{counter}{ext}"
+                counter += 1
+            
+            full_output_path = os.path.join(output_path, unique_file_name)
+            file_name = unique_file_name # Actualiza file_name para el registro y el resumen
 
             # --- Check if file already exists and skip if so ---
             if os.path.exists(full_output_path) and os.path.getsize(full_output_path) > 0:
@@ -303,6 +319,9 @@ def main():
                         help=f"Maximum number of retries per download (default: {DEFAULT_MAX_RETRIES}).")
     parser.add_argument("--input-file", type=str,
                         help="Path to a text file containing Google Drive links (one link per line).")
+    # 🔧 Mejora 3: Modo Dry Run
+    parser.add_argument("--dry-run", action="store_true",
+                        help="If set, the script will only validate links and show a summary, without downloading any files.")
     args = parser.parse_args()
 
     # --- Ensure the download folder exists before configuring the logger ---
@@ -330,6 +349,16 @@ def main():
         total_memory_bytes = psutil.virtual_memory().total
         logger.info(f"Total system memory: {total_memory_bytes / (1024**3):.2f} GB")
     
+    # 🔧 Mejora 2: Verificación de conexión a Google Drive antes de iniciar
+    logger.info("Verificando conexión a Google Drive...")
+    try:
+        # Intenta conectar a la URL principal de Google Drive
+        requests.get("https://drive.google.com", timeout=10)
+        logger.info("Conexión a Google Drive exitosa.")
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Error de conexión a Google Drive: No se pudo conectar a https://drive.google.com. Por favor, verifica tu conexión a internet. Error: {e}")
+        return # Finaliza el script si la conexión falla
+
     # Read links from a text file or in-memory list
     drive_links = []
     if args.input_file:
@@ -382,6 +411,26 @@ def main():
 
     if not valid_links_found:
         logger.error("No valid Google Drive FILEIDs found in the provided input. Exiting.")
+        # 🔧 Mejora 3: Modo Dry Run - Si no hay enlaces válidos y estamos en dry run, igual mostramos el resumen
+        if args.dry_run:
+            logger.info("\n--- Modo Dry Run Activado ---")
+            logger.info(f"Se encontraron {len(download_tasks)} enlaces válidos para descargar.")
+            if failed_original_links:
+                logger.info(f"Se encontraron {len(failed_original_links)} enlaces inválidos o con ID no extraíble:")
+                for link in sorted(list(failed_original_links)):
+                    logger.info(f"  - {link}")
+            logger.info("El script finalizará sin realizar descargas.")
+        return
+
+    # 🔧 Mejora 3: Modo Dry Run - Si está activado, muestra el resumen y finaliza
+    if args.dry_run:
+        logger.info("\n--- Modo Dry Run Activado ---")
+        logger.info(f"Se encontraron {len(download_tasks)} enlaces válidos para descargar.")
+        if failed_original_links:
+            logger.info(f"Se encontraron {len(failed_original_links)} enlaces inválidos o con ID no extraíble:")
+            for link in sorted(list(failed_original_links)):
+                logger.info(f"  - {link}")
+        logger.info("El script finalizará sin realizar descargas.")
         return
 
     # Download in parallel if configured
@@ -578,6 +627,16 @@ def main():
             logger.info(f"Download summary saved to: '{os.path.abspath(summary_csv_path)}'")
         except Exception as e:
             logger.error(f"Error saving download summary to CSV: {e}")
+
+    # 🔧 Mejora 4: Generar resumen en JSON
+    if download_summary_data:
+        summary_json_path = os.path.join(DOWNLOAD_FOLDER, "download_summary.json")
+        try:
+            with open(summary_json_path, 'w', encoding='utf-8') as jsonfile:
+                json.dump(download_summary_data, jsonfile, indent=4, ensure_ascii=False)
+            logger.info(f"Resumen de descargas guardado en JSON: '{os.path.abspath(summary_json_path)}'")
+        except Exception as e:
+            logger.error(f"Error al guardar el resumen de descargas en JSON: {e}")
 
     # --- Save Failed Links to a Separate File ---
     if failed_original_links:

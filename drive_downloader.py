@@ -4,20 +4,20 @@ import time
 import requests
 from tqdm import tqdm
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from bs4 import BeautifulSoup # Importación de BeautifulSoup para parsear HTML
+from bs4 import BeautifulSoup # Import BeautifulSoup for HTML parsing
 
-# --- Configuración ---
-DOWNLOAD_FOLDER = "descargas_drive"  # Carpeta donde se guardarán los archivos
-MAX_RETRIES = 3                     # Número máximo de reintentos por descarga
-RETRY_BACKOFF_FACTOR = 1            # Factor para el backoff exponencial (1s, 2s, 4s, etc.)
-MAX_PARALLEL_DOWNLOADS = 4          # Número máximo de descargas concurrentes (opcional)
+# --- Configuration ---
+DOWNLOAD_FOLDER = "drive_downloads"  # Folder where files will be saved
+MAX_RETRIES = 3                     # Maximum number of retries per download
+RETRY_BACKOFF_FACTOR = 1            # Factor for exponential backoff (1s, 2s, 4s, etc.)
+MAX_PARALLEL_DOWNLOADS = 4          # Maximum number of concurrent downloads (optional)
 
-# --- Funciones Auxiliares ---
+# --- Helper Functions ---
 
 def extract_file_id(url):
     """
-    Extrae el FILEID de una URL de Google Drive.
-    Soporta formatos como:
+    Extracts the FILEID from a Google Drive URL.
+    Supports formats like:
     - https://drive.google.com/file/d/FILEID/view
     - https://drive.google.com/open?id=FILEID
     - https://drive.google.com/uc?export=download&id=FILEID
@@ -29,8 +29,8 @@ def extract_file_id(url):
 
 def download_file_from_google_drive(file_id, output_path):
     """
-    Descarga un archivo de Google Drive, manejando la confirmación de archivos grandes
-    y reintentos exponenciales.
+    Downloads a file from Google Drive, handling large file confirmation
+    and exponential retries.
     """
     download_url = f"https://drive.google.com/uc?export=download&id={file_id}"
     session = requests.Session()
@@ -38,30 +38,30 @@ def download_file_from_google_drive(file_id, output_path):
 
     for retry_count in range(MAX_RETRIES + 1):
         try:
-            # Primer intento para obtener el archivo.
-            # Podría ser la descarga directa o la página de advertencia.
+            # First attempt to get the file.
+            # This could be the direct download or the warning page.
             response = session.get(download_url, stream=True)
-            response.raise_for_status()  # Lanza una excepción para códigos de estado HTTP erróneos
+            response.raise_for_status()  # Raises an exception for bad HTTP status codes
 
-            # --- Detección y manejo de la página de advertencia de Google Drive ---
-            # Google devuelve una página HTML de advertencia para archivos > 100MB
-            # que no han sido escaneados en busca de virus.
+            # --- Detect and handle Google Drive virus scan warning page ---
+            # Google returns an HTML warning page for files > 100MB
+            # that have not been scanned for viruses.
             if 'Content-Type' in response.headers and 'text/html' in response.headers['Content-Type']:
-                log_messages.append(f"Detectada página de advertencia de Google Drive para {file_id}. Intentando extraer formulario de confirmación.")
+                log_messages.append(f"Detected Google Drive warning page for {file_id}. Attempting to extract confirmation form.")
                 
-                # Parsear el contenido HTML para encontrar el formulario de confirmación
+                # Parse the HTML content to find the confirmation form
                 soup = BeautifulSoup(response.text, 'html.parser')
                 
-                # Buscar el formulario con id="download-form"
+                # Look for the form with id="download-form"
                 download_form = soup.find('form', {'id': 'download-form'})
 
                 if download_form:
-                    # Extraer la URL de acción del formulario, que será el endpoint real de descarga
+                    # Extract the action URL from the form, which will be the real download endpoint
                     action_url = download_form.get('action')
-                    if not action_url.startswith('http'): # Asegurarse de que sea una URL absoluta
+                    if not action_url.startswith('http'): # Ensure it's an absolute URL
                         action_url = f"https://drive.google.com{action_url}"
 
-                    # Recoger todos los campos ocultos (input type="hidden") del formulario
+                    # Collect all hidden input fields from the form
                     params = {}
                     hidden_inputs = download_form.find_all('input', {'type': 'hidden'})
                     for input_tag in hidden_inputs:
@@ -70,23 +70,23 @@ def download_file_from_google_drive(file_id, output_path):
                         if name and value:
                             params[name] = value
 
-                    log_messages.append(f"Formulario de confirmación encontrado. Reintentando descarga con parámetros del formulario para {file_id}.")
+                    log_messages.append(f"Confirmation form found. Retrying download with form parameters for {file_id}.")
                     
-                    # Realizar la segunda solicitud GET al endpoint de acción con todos los parámetros ocultos.
-                    # Esto simula el envío del formulario y debería iniciar la descarga binaria.
+                    # Make the second GET request to the action endpoint with all hidden parameters.
+                    # This simulates submitting the form and should initiate the binary download.
                     response = session.get(action_url, params=params, stream=True)
                     response.raise_for_status()
                 else:
-                    # Si se detecta HTML pero no se encuentra el formulario, es un fallo inesperado
-                    log_messages.append(f"Advertencia: Página HTML detectada para {file_id}, pero no se encontró el formulario de descarga. Esto podría indicar un cambio en la página de advertencia de Google Drive o un problema de acceso.")
-                    raise requests.exceptions.RequestException("No se encontró el formulario de descarga en la página de advertencia.")
+                    # If HTML is detected but the form is not found, it's an unexpected failure
+                    log_messages.append(f"Warning: HTML page detected for {file_id}, but the download form was not found. This might indicate a change in Google Drive's warning page or an access issue.")
+                    raise requests.exceptions.RequestException("Download form not found on the warning page.")
 
-            # --- Continuación del flujo de descarga normal ---
-            # Obtener el nombre del archivo desde los encabezados o usar el file_id
+            # --- Continue with normal download flow ---
+            # Get the file name from headers or use the file_id
             file_name = None
             if 'Content-Disposition' in response.headers:
-                # Intenta extraer el nombre de archivo del Content-Disposition,
-                # que es el método preferido para obtener el nombre original.
+                # Attempt to extract the file name from Content-Disposition,
+                # which is the preferred method for getting the original name.
                 fname_match = re.search(r'filename\*?=UTF-8\'\'(.+)', response.headers['Content-Disposition'])
                 if fname_match:
                     file_name = requests.utils.unquote(fname_match.group(1))
@@ -96,92 +96,92 @@ def download_file_from_google_drive(file_id, output_path):
                         file_name = fname_match.group(1)
 
             if not file_name:
-                file_name = f"{file_id}.bin" # Nombre por defecto si no se puede extraer
+                file_name = f"{file_id}.bin" # Default name if extraction fails
 
             full_output_path = os.path.join(output_path, file_name)
             total_size = int(response.headers.get('content-length', 0))
 
             with open(full_output_path, 'wb') as f:
-                # Usar tqdm para mostrar una barra de progreso de la descarga
+                # Use tqdm to show a download progress bar
                 with tqdm(total=total_size, unit='B', unit_scale=True, desc=file_name) as pbar:
                     for chunk in response.iter_content(chunk_size=8192):
                         if chunk:
                             f.write(chunk)
                             pbar.update(len(chunk))
 
-            log_messages.append(f"Éxito: '{file_name}' descargado en '{full_output_path}'")
+            log_messages.append(f"Success: '{file_name}' downloaded to '{full_output_path}'")
             return True, log_messages
 
         except requests.exceptions.RequestException as e:
-            # Manejo de errores de red o HTTP y reintentos exponenciales
-            log_messages.append(f"Error en el intento {retry_count + 1} para {file_id}: {e}")
+            # Handle network or HTTP errors and exponential retries
+            log_messages.append(f"Error on attempt {retry_count + 1} for {file_id}: {e}")
             if retry_count < MAX_RETRIES:
                 wait_time = RETRY_BACKOFF_FACTOR * (2 ** retry_count)
-                log_messages.append(f"Reintentando en {wait_time} segundos...")
+                log_messages.append(f"Retrying in {wait_time} seconds...")
                 time.sleep(wait_time)
             else:
-                log_messages.append(f"Fallo definitivo: No se pudo descargar {file_id} después de {MAX_RETRIES} reintentos.")
+                log_messages.append(f"Final failure: Could not download {file_id} after {MAX_RETRIES} retries.")
                 return False, log_messages
         except Exception as e:
-            # Captura cualquier otra excepción inesperada
-            log_messages.append(f"Error inesperado al descargar {file_id}: {e}")
+            # Catch any other unexpected exceptions
+            log_messages.append(f"Unexpected error while downloading {file_id}: {e}")
             return False, log_messages
 
-# --- Función Principal ---
+# --- Main Function ---
 
 def main():
-    print("--- Iniciando el Descargador de Google Drive ---")
+    print("--- Starting Google Drive Downloader ---")
 
-    # Asegurarse de que la carpeta de descarga exista
+    # Ensure the download folder exists
     os.makedirs(DOWNLOAD_FOLDER, exist_ok=True)
-    print(f"Los archivos se guardarán en: '{os.path.abspath(DOWNLOAD_FOLDER)}'")
+    print(f"Files will be saved in: '{os.path.abspath(DOWNLOAD_FOLDER)}'")
 
-    # Leer enlaces desde un archivo o lista en memoria
+    # Read links from a text file or in-memory list
     drive_links = []
-    input_choice = input("¿Deseas introducir los enlaces desde un archivo de texto (f) o directamente aquí (m)? [f/m]: ").lower()
+    input_choice = input("Do you want to enter links from a text file (f) or directly here (m)? [f/m]: ").lower()
 
     if input_choice == 'f':
-        file_path = input("Introduce la ruta del archivo de texto con los enlaces (un enlace por línea): ")
+        file_path = input("Enter the path to the text file with links (one link per line): ")
         try:
             with open(file_path, 'r') as f:
                 drive_links = [line.strip() for line in f if line.strip()]
-            print(f"Se han cargado {len(drive_links)} enlaces desde '{file_path}'.")
+            print(f"Loaded {len(drive_links)} links from '{file_path}'.")
         except FileNotFoundError:
-            print(f"Error: El archivo '{file_path}' no fue encontrado.")
+            print(f"Error: The file '{file_path}' was not found.")
             return
     elif input_choice == 'm':
-        print("Introduce los enlaces de Google Drive (uno por línea). Presiona Enter dos veces para finalizar:")
+        print("Enter Google Drive links (one per line). Press Enter twice to finish:")
         while True:
             link = input()
             if not link:
                 break
             drive_links.append(link.strip())
-        print(f"Se han introducido {len(drive_links)} enlaces.")
+        print(f"Entered {len(drive_links)} links.")
     else:
-        print("Opción no válida. Saliendo.")
+        print("Invalid option. Exiting.")
         return
 
     if not drive_links:
-        print("No se proporcionaron enlaces para descargar. Saliendo.")
+        print("No links provided for download. Exiting.")
         return
 
-    # Procesar enlaces
+    # Process links
     download_tasks = []
     for link in drive_links:
         file_id = extract_file_id(link)
         if file_id:
             download_tasks.append((file_id, DOWNLOAD_FOLDER))
         else:
-            print(f"Advertencia: No se pudo extraer el FILEID de la URL: {link}. Se omitirá.")
+            print(f"Warning: Could not extract FILEID from URL: {link}. It will be skipped.")
 
     if not download_tasks:
-        print("No se encontraron FILEIDs válidos para descargar. Saliendo.")
+        print("No valid FILEIDs found for download. Exiting.")
         return
 
-    # Descargar en paralelo si está configurado
+    # Download in parallel if configured
     log_results = []
     if MAX_PARALLEL_DOWNLOADS > 1:
-        print(f"\nIniciando descargas en paralelo ({MAX_PARALLEL_DOWNLOADS} hilos/procesos)...")
+        print(f"\nStarting parallel downloads ({MAX_PARALLEL_DOWNLOADS} threads/processes)...")
         with ThreadPoolExecutor(max_workers=MAX_PARALLEL_DOWNLOADS) as executor:
             future_to_file_id = {executor.submit(download_file_from_google_drive, file_id, output_path): file_id for file_id, output_path in download_tasks}
             for future in as_completed(future_to_file_id):
@@ -189,19 +189,19 @@ def main():
                 success, messages = future.result()
                 log_results.extend(messages)
     else:
-        print("\nIniciando descargas secuenciales...")
+        print("\nStarting sequential downloads...")
         for file_id, output_path in download_tasks:
             success, messages = download_file_from_google_drive(file_id, output_path)
             log_results.extend(messages)
 
-    # --- Registro de Logs ---
-    log_file_path = os.path.join(DOWNLOAD_FOLDER, "descargas_log.txt")
+    # --- Log Results ---
+    log_file_path = os.path.join(DOWNLOAD_FOLDER, "downloads_log.txt")
     with open(log_file_path, "w") as f:
         for msg in log_results:
             f.write(msg + "\n")
-            print(msg) # También imprime en consola
+            print(msg) # Also prints to console
 
-    print(f"\nProceso de descarga finalizado. Revisa el log en: '{os.path.abspath(log_file_path)}'")
+    print(f"\nDownload process finished. Check the log at: '{os.path.abspath(log_file_path)}'")
 
 if __name__ == "__main__":
     main()

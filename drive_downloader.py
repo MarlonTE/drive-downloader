@@ -257,122 +257,64 @@ def download_file_from_google_drive(file_id: str, output_path: str, max_retries:
     """
     Downloads a file from Google Drive, handling large file confirmation,
     exponential retries, and logging download timing and speed.
-
-    Args:
-        file_id (str): The ID of the Google Drive file.
-        output_path (str): The directory where the file will be saved.
-        max_retries (int): Maximum number of retry attempts.
-        chunk_size (int): Size of chunks for streaming download.
-
-    Returns:
-        tuple[bool, str, int, float, str, str | None]: A tuple containing:
-            - bool: True if download was successful or skipped, False otherwise.
-            - str: The determined file name.
-            - int: Total size of the file in bytes.
-            - float: Start time of the download process (time.time()).
-            - str: Status of the download ("Success", "Skipped", "Failed", "Failed (Quota Exceeded)", etc.).
-            - str | None: SHA256 hash of the downloaded file, or None if not calculated/failed.
+    This function has been refactored to handle HTML error pages more robustly
+    and ensure correct file size reporting for resume.
     """
     download_url = f"https://drive.google.com/uc?export=download&id={file_id}"
     session = requests.Session()
     
     start_time = time.time()
     file_name = f"{file_id}.bin" # Default name, will be updated if Content-Disposition is found
-    total_size = 0
-    status = "Failed" # Default status for early exit scenarios
+    total_file_size_expected = 0 # This will store the expected total size of the actual file
+    status = "Failed"
     sha256_hash_result = None
 
     for retry_count in range(max_retries + 1):
+        current_downloaded_bytes = 0
+        headers = {}
+        full_output_path = os.path.join(output_path, file_name) # Initialize with default, will be updated
+
+        # --- 🔧 Mejora: Manejo más robusto de respuestas HTML y reanudación ---
+        # Paso 1: Realizar una solicitud "pre-vuelo" para obtener metadatos y manejar la página de confirmación.
+        # Esto nos permite obtener el nombre del archivo y el tamaño total esperado ANTES de intentar la descarga real.
+        
+        pre_flight_url = download_url
+        pre_flight_params = {} # Parámetros si se encuentra un formulario de confirmación
+        target_response_headers = None # Encabezados de la respuesta que contiene el Content-Disposition y Content-Length
+
         try:
-            # Determine file name before checking for existence and resuming
-            # Make a HEAD request to get headers without downloading content
-            head_response = session.head(download_url, allow_redirects=True, timeout=10)
-            head_response.raise_for_status()
+            # Intentar obtener los encabezados del archivo o la página de confirmación/error.
+            # Usamos GET con stream=True por si es una descarga directa que no tiene HEAD.
+            pre_flight_response = session.get(pre_flight_url, stream=True, timeout=15)
+            pre_flight_response.raise_for_status()
 
-            if 'Content-Disposition' in head_response.headers:
-                fname_match = re.search(r'filename\*?=UTF-8\'\'(.+)', head_response.headers['Content-Disposition'])
-                if fname_match:
-                    file_name = requests.utils.unquote(fname_match.group(1))
-                else:
-                    fname_match = re.search(r'filename="([^"]+)"', head_response.headers['Content-Disposition'])
-                    if fname_match:
-                        file_name = fname_match.group(1)
-            
-            sanitized_file_name = "".join([c for c in file_name if c.isalnum() or c in ('.', '_', '-')])
-            if not sanitized_file_name:
-                sanitized_file_name = file_name
-            
-            # 🔧 Mejora 1: Validación más robusta del nombre de archivo
-            # Asegura que el nombre de archivo sea único en la carpeta de descarga
-            base_name, ext = os.path.splitext(sanitized_file_name)
-            unique_file_name = sanitized_file_name
-            
-            # Si el nombre de archivo ya existe o es genérico/vacío, añade el file_id para asegurar unicidad.
-            # Se añade un contador si incluso con el file_id el nombre sigue existiendo (caso muy raro).
-            counter = 0
-            while os.path.exists(os.path.join(output_path, unique_file_name)):
-                if counter == 0: # Primera vez que se detecta un conflicto, añade el file_id
-                    unique_file_name = f"{base_name}_{file_id}{ext}"
-                else: # Si sigue habiendo conflicto, añade un contador adicional
-                    unique_file_name = f"{base_name}_{file_id}_{counter}{ext}"
-                counter += 1
-            
-            full_output_path = os.path.join(output_path, unique_file_name)
-            file_name = unique_file_name # Actualiza file_name para el registro y el resumen
-
-            # 🔧 Mejora 1: Soporte para descargas reanudables
-            headers = {}
-            downloaded_bytes = 0
-            # Si el archivo ya existe, intentamos reanudar la descarga
-            if os.path.exists(full_output_path):
-                downloaded_bytes = os.path.getsize(full_output_path)
-                if downloaded_bytes > 0:
-                    headers['Range'] = f'bytes={downloaded_bytes}-' # Solicita bytes desde el tamaño existente
-                    logger.info(f"Reanudando descarga para '{file_name}' desde {downloaded_bytes} bytes.")
+            # Si la respuesta es HTML, procesarla para ver si es una página de confirmación o un error.
+            if 'Content-Type' in pre_flight_response.headers and 'text/html' in pre_flight_response.headers['Content-Type']:
+                logger.info(f"Se detectó respuesta HTML de Google Drive para {file_id} durante el pre-vuelo. Verificando formulario de confirmación o mensajes de error.")
                 
-            # Primera solicitud GET para obtener el archivo.
-            # Esto podría ser la descarga directa o la página de advertencia.
-            response = session.get(download_url, stream=True, headers=headers, timeout=30)
-            response.raise_for_status()  # Lanza una excepción para códigos de estado HTTP erróneos
-
-            # Verificar si el servidor honró la cabecera Range
-            if response.status_code == 206: # Contenido Parcial
-                logger.info(f"El servidor honró la cabecera Range para '{file_name}'. Reanudando.")
-            elif downloaded_bytes > 0 and response.status_code == 200: # Contenido completo, pero pedimos parcial
-                logger.warning(f"El servidor NO honró la cabecera Range para '{file_name}'. Reiniciando descarga desde el principio.")
-                downloaded_bytes = 0 # Reiniciar a 0 para empezar de cero
-            
-            # --- Detectar y manejar respuestas HTML de Google Drive (página de advertencia o error) ---
-            if 'Content-Type' in response.headers and 'text/html' in response.headers['Content-Type']:
-                logger.info(f"Se detectó respuesta HTML de Google Drive para {file_id}. Verificando formulario de confirmación o mensajes de error.")
-                
-                soup = BeautifulSoup(response.text, 'html.parser')
+                soup = BeautifulSoup(pre_flight_response.text, 'html.parser')
                 download_form = soup.find('form', {'id': 'download-form'})
 
                 if download_form:
                     # Si se encuentra un formulario de descarga, es la página de confirmación de archivo grande.
                     action_url = download_form.get('action')
-                    if not action_url.startswith('http'): # Asegurarse de que sea una URL absoluta
+                    if not action_url.startswith('http'):
                         action_url = f"https://drive.google.com{action_url}"
-
-                    # Recolectar todos los campos de entrada ocultos del formulario
-                    params = {}
-                    hidden_inputs = download_form.find_all('input', {'type': 'hidden'})
-                    for input_tag in hidden_inputs:
-                        name = input_tag.get('name')
-                        value = input_tag.get('value')
-                        if name and value:
-                            params[name] = value
-
-                    logger.info(f"Formulario de confirmación encontrado. Reintentando descarga con parámetros del formulario para {file_id}.")
                     
-                    # Hacer la segunda solicitud GET al endpoint de acción con todos los parámetros ocultos.
-                    # Esto simula el envío del formulario y debería iniciar la descarga binaria.
-                    response = session.get(action_url, params=params, stream=True, headers=headers, timeout=30) # Pasar las cabeceras de nuevo
-                    response.raise_for_status()
+                    # Recolectar todos los campos de entrada ocultos del formulario
+                    pre_flight_params = {input_tag.get('name'): input_tag.get('value') for input_tag in download_form.find_all('input', {'type': 'hidden'}) if input_tag.get('name') and input_tag.get('value')}
+                    
+                    logger.info(f"Formulario de confirmación encontrado. Se usarán los parámetros del formulario para {file_id}.")
+
+                    # Ahora, hacer una solicitud HEAD al *punto de descarga real* (la URL de acción del formulario)
+                    # para obtener los encabezados precisos (Content-Disposition, Content-Length).
+                    head_response_after_form = session.head(action_url, params=pre_flight_params, allow_redirects=True, timeout=10)
+                    head_response_after_form.raise_for_status()
+                    target_response_headers = head_response_after_form.headers
+                    download_url = action_url # Actualizar la URL de descarga para la solicitud principal
                 else:
-                    # Si se detecta HTML pero no se encuentra el formulario, verificar mensajes de error específicos.
-                    page_text = response.text.lower()
+                    # Es HTML, pero no es un formulario de confirmación -> es una página de error (cuota, acceso denegado, etc.).
+                    page_text = pre_flight_response.text.lower()
                     quota_keywords = ["quota exceeded", "limit exceeded", "excess traffic", "download limit", "virus scan warning"]
                     is_quota_error = any(keyword in page_text for keyword in quota_keywords)
 
@@ -385,33 +327,123 @@ def download_file_from_google_drive(file_id: str, output_path: str, max_retries:
                             f"➤ Nota: Si se creó un archivo .bin, NO es el archivo original, sino una respuesta de error automática de Google."
                         )
                         logger.error(error_message)
-                        return False, file_name, total_size, start_time, status, sha256_hash_result
+                        return False, file_name, total_file_size_expected, start_time, status, sha256_hash_result
                     else:
-                        logger.warning(f"Página HTML detectada para {file_id}, pero no se encontró formulario de descarga o texto específico de advertencia de cuota/virus. Esto podría indicar un cambio en la página de advertencia de Google Drive o un problema de acceso.")
-                        raise requests.exceptions.RequestException("Formulario de descarga no encontrado o página de advertencia HTML no reconocida.")
+                        # HTML genérico no reconocido como confirmación o cuota.
+                        logger.warning(f"Página HTML detectada para {file_id}, pero no se encontró formulario de descarga o texto específico de cuota/virus. Esto podría indicar un cambio en la página de advertencia de Google Drive o un problema de acceso.")
+                        status = "Failed (Unrecognized HTML Page)"
+                        return False, file_name, total_file_size_expected, start_time, status, sha256_hash_result
+            else:
+                # La respuesta del pre-vuelo no fue HTML, lo que significa que es directamente el contenido binario.
+                target_response_headers = pre_flight_response.headers
+                # Consumir el contenido del pre_flight_response para liberar la conexión
+                for _ in pre_flight_response.iter_content(chunk_size=chunk_size):
+                    pass # Discard content
+                pre_flight_response.close() # Close the connection
 
-            # --- Continuar con el flujo normal de descarga ---
-            # Sumar los bytes ya descargados al tamaño total esperado para la barra de progreso
-            total_size = int(response.headers.get('content-length', 0)) + downloaded_bytes 
+            # Extraer el nombre del archivo de los encabezados de la respuesta final (después de cualquier redirección/confirmación).
+            if 'Content-Disposition' in target_response_headers:
+                fname_match = re.search(r'filename\*?=UTF-8\'\'(.+)', target_response_headers['Content-Disposition'])
+                if fname_match:
+                    file_name = requests.utils.unquote(fname_match.group(1))
+                else:
+                    fname_match = re.search(r'filename="([^"]+)"', target_response_headers['Content-Disposition'])
+                    if fname_match:
+                        file_name = fname_match.group(1)
+            
+            sanitized_file_name = "".join([c for c in file_name if c.isalnum() or c in ('.', '_', '-')])
+            if not sanitized_file_name:
+                sanitized_file_name = file_name
+            
+            # 🔧 Mejora 1: Validación más robusta del nombre de archivo (aplicada también a API)
+            base_name, ext = os.path.splitext(sanitized_file_name)
+            unique_file_name = sanitized_file_name
+            counter = 0
+            while os.path.exists(os.path.join(output_path, unique_file_name)):
+                if counter == 0:
+                    unique_file_name = f"{base_name}_{file_id}{ext}"
+                else:
+                    unique_file_name = f"{base_name}_{file_id}_{counter}{ext}"
+                counter += 1
+            
+            full_output_path = os.path.join(output_path, unique_file_name)
+            file_name = unique_file_name # Actualiza file_name para el registro y el resumen
 
+            # Obtener el tamaño total esperado del archivo de los encabezados.
+            total_file_size_expected = int(target_response_headers.get('content-length', 0))
+
+            # Verificar si el archivo ya existe para reanudar la descarga.
+            file_mode = 'wb' # Por defecto, escribir binario (nuevo archivo o sobrescribir)
+            if os.path.exists(full_output_path):
+                current_downloaded_bytes = os.path.getsize(full_output_path)
+                if current_downloaded_bytes == total_file_size_expected and total_file_size_expected > 0:
+                    status = "Skipped"
+                    sha256_hash_result = calculate_sha256(full_output_path, chunk_size)
+                    logger.info(f"Archivo '{file_name}' ya descargado completamente. Omitiendo.")
+                    return True, file_name, total_file_size_expected, start_time, status, sha256_hash_result
+                elif current_downloaded_bytes > 0:
+                    logger.info(f"Reanudando descarga para '{file_name}' desde {current_downloaded_bytes} bytes.")
+                    headers['Range'] = f'bytes={current_downloaded_bytes}-' # Solicitar bytes desde el tamaño existente
+                    file_mode = 'ab' # Abrir en modo append binario
+                else:
+                    # El archivo existe pero está vacío o corrupto, reiniciar la descarga.
+                    current_downloaded_bytes = 0
+                    file_mode = 'wb'
+                    logger.info(f"Archivo '{file_name}' existe pero está vacío/corrupto. Reiniciando descarga.")
+
+        except (requests.exceptions.RequestException, requests.exceptions.Timeout) as e:
+            logger.error(f"Error durante el pre-vuelo o la solicitud inicial para {file_id} ('{file_name}'): {e}")
+            if retry_count < max_retries:
+                wait_time = RETRY_BACKOFF_FACTOR * (2 ** retry_count)
+                logger.info(f"Reintentando en {wait_time} segundos...")
+                time.sleep(wait_time)
+                continue # Continuar al siguiente intento de reintento
+            else:
+                status = "Failed (Pre-vuelo/Error de solicitud inicial)"
+                logger.error(f"Fallo final: No se pudo obtener metadatos o manejar la confirmación para {file_id} ('{file_name}') después de {max_retries} reintentos.")
+                return False, file_name, total_file_size_expected, start_time, status, sha256_hash_result
+        except Exception as e:
+            status = "Failed (Error inesperado durante el pre-vuelo)"
+            logger.critical(f"Error inesperado durante el pre-vuelo para {file_id} ('{file_name}'): {e}", exc_info=True)
+            return False, file_name, total_file_size_expected, start_time, status, sha256_hash_result
+
+        # --- Paso 2: Iniciar el flujo de descarga real ---
+        try:
+            # Esta es la solicitud principal para obtener el contenido del archivo.
+            # Se pasan los parámetros obtenidos del formulario de confirmación (si los hay) y los encabezados de reanudación.
+            response = session.get(download_url, params=pre_flight_params, stream=True, headers=headers, timeout=60) # Aumentar timeout para descarga real
+            response.raise_for_status()
+
+            # Verificar si el servidor honró el encabezado Range para la reanudación.
+            if current_downloaded_bytes > 0 and response.status_code == 200: # Solicitamos parcial, pero obtuvimos completo
+                logger.warning(f"El servidor NO honró el encabezado Range para '{file_name}'. Reiniciando descarga desde el principio.")
+                current_downloaded_bytes = 0 # Reiniciar a 0 para empezar de cero
+                file_mode = 'wb' # Sobrescribir el archivo existente
+
+            # Asegurarse de que el tipo de contenido no sea HTML aquí, después de todas las verificaciones de pre-vuelo.
+            if 'Content-Type' in response.headers and 'text/html' in response.headers['Content-Type']:
+                # 💡 Mensaje de error más específico para el log y la consola
+                logger.error(f"¡Error crítico! Se recibió contenido HTML inesperado durante la descarga principal para el archivo con ID {file_id}. Esto indica un problema de acceso o un cambio en la respuesta de Google Drive que no fue manejado en el pre-vuelo. El archivo descargado podría ser una página de error.")
+                status = "Failed (Contenido HTML inesperado)"
+                return False, file_name, total_file_size_expected, start_time, status, sha256_hash_result
+
+            # Ahora, proceder con la escritura del contenido binario
+            downloaded_chunks_bytes = 0 # Bytes descargados en este intento específico
             last_throughput_check_time = time.time()
             bytes_since_last_check = 0
             low_throughput_start_time = None
 
-            # 🔧 Mejora 1: Soporte para descargas reanudables - Abrir en modo append binario ('ab')
-            with open(full_output_path, 'ab') as f:
-                # Usar tqdm para mostrar una barra de progreso de descarga
-                with tqdm(total=total_size, unit='B', unit_scale=True, desc=file_name, initial=downloaded_bytes) as pbar:
+            with open(full_output_path, file_mode) as f:
+                with tqdm(total=total_file_size_expected, unit='B', unit_scale=True, desc=file_name, initial=current_downloaded_bytes) as pbar:
                     for chunk in response.iter_content(chunk_size=chunk_size):
                         if chunk:
                             f.write(chunk)
                             pbar.update(len(chunk))
-                            downloaded_bytes += len(chunk)
+                            downloaded_chunks_bytes += len(chunk)
                             bytes_since_last_check += len(chunk)
 
                             current_time = time.time()
-                            # La lógica de verificación de rendimiento permanece igual
-                            if current_time - last_throughput_check_time >= 5: # Verificar cada 5 segundos
+                            if current_time - last_throughput_check_time >= 5:
                                 elapsed_check_time = current_time - last_throughput_check_time
                                 current_throughput = bytes_since_last_check / elapsed_check_time if elapsed_check_time > 0 else 0
 
@@ -436,24 +468,24 @@ def download_file_from_google_drive(file_id: str, output_path: str, max_retries:
                 logger.info(f"SHA256 hash calculado y guardado para '{file_name}': {sha256_hash_result}")
 
             status = "Success"
-            return True, file_name, total_size, start_time, status, sha256_hash_result
+            return True, file_name, total_file_size_expected, start_time, status, sha256_hash_result
 
         except (requests.exceptions.RequestException, requests.exceptions.Timeout) as e:
-            logger.error(f"Error en el intento {retry_count + 1} para {file_id} ('{file_name}'): {e}")
+            logger.error(f"Error durante el intento de descarga principal {retry_count + 1} para {file_id} ('{file_name}'): {e}")
             if retry_count < max_retries:
                 wait_time = RETRY_BACKOFF_FACTOR * (2 ** retry_count)
                 logger.info(f"Reintentando en {wait_time} segundos...")
                 time.sleep(wait_time)
             else:
-                status = "Failed (Max Retries)"
+                status = "Failed (Máx. reintentos para descarga principal)"
                 logger.error(f"Fallo final: No se pudo descargar {file_id} ('{file_name}') después de {max_retries} reintentos.")
-                return False, file_name, total_size, start_time, status, sha256_hash_result
+                return False, file_name, total_file_size_expected, start_time, status, sha256_hash_result
         except Exception as e:
-            status = "Failed (Unexpected Error)"
+            status = "Failed (Error inesperado durante la descarga principal)"
             logger.critical(f"Error inesperado al descargar {file_id} ('{file_name}'): {e}", exc_info=True)
-            return False, file_name, total_size, start_time, status, sha256_hash_result
+            return False, file_name, total_file_size_expected, start_time, status, sha256_hash_result
     
-    return False, file_name, total_size, start_time, status, sha256_hash_result
+    return False, file_name, total_file_size_expected, start_time, status, sha256_hash_result
 
 # --- Main Function ---
 
@@ -686,7 +718,7 @@ def main():
         if global_failed_original_links:
             logger.info(f"Se encontraron {len(global_failed_original_links)} enlaces inválidos o con ID no extraíble:")
             for link in sorted(list(global_failed_original_links)):
-                logger.info(f"  - {link}")
+                    logger.info(f"  - {link}")
         logger.info("El script finalizará sin realizar descargas.")
         return
 

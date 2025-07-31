@@ -21,6 +21,7 @@ from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
 import io # Necesario para MediaIoBaseDownload
+from google.auth.exceptions import RefreshError # Importar para manejar errores de refresco de token
 
 # Para la Mejora 5 (FastAPI):
 # pip install fastapi uvicorn
@@ -134,20 +135,52 @@ def get_google_drive_api_credentials():
     creds = None
     # El archivo token.json almacena los tokens de acceso y refresco del usuario.
     if os.path.exists('token.json'):
-        creds = Credentials.from_authorized_user_file('token.json', SCOPES)
+        try:
+            creds = Credentials.from_authorized_user_file('token.json', SCOPES)
+        except Exception as e:
+            logger.error(f"Error al cargar credenciales desde 'token.json': {e}. Se intentará reautenticar.")
+            creds = None
+    
     # Si no hay credenciales válidas o no existen, se intenta refrescar o generar nuevas.
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
-        else:
-            # El archivo credentials.json se descarga desde Google Cloud Console.
-            # Debe estar en el mismo directorio que este script.
-            flow = InstalledAppFlow.from_client_secrets_file(
-                'credentials.json', SCOPES)
-            creds = flow.run_local_server(port=0) # Inicia un servidor local para el flujo de autenticación
+            try:
+                creds.refresh(Request())
+            except RefreshError as e:
+                logger.error(f"Error al refrescar el token de acceso: {e}. Las credenciales podrían ser inválidas. Se requiere reautenticación.")
+                creds = None
+            except requests.exceptions.RequestException as e:
+                logger.error(f"Error de red al intentar refrescar el token: {e}. Verifica tu conexión a internet.")
+                creds = None
+            except Exception as e:
+                logger.error(f"Error inesperado al refrescar el token: {e}.")
+                creds = None
+        
+        if not creds or not creds.valid: # Si después del refresco sigue sin ser válido o no existe
+            try:
+                # El archivo credentials.json se descarga desde Google Cloud Console.
+                # Debe estar en el mismo directorio que este script.
+                flow = InstalledAppFlow.from_client_secrets_file(
+                    'credentials.json', SCOPES)
+                creds = flow.run_local_server(port=0) # Inicia un servidor local para el flujo de autenticación
+            except FileNotFoundError:
+                logger.error("Error: 'credentials.json' no encontrado. Necesitas descargar este archivo desde Google Cloud Console para usar la API.")
+                return None
+            except requests.exceptions.RequestException as e:
+                logger.error(f"Error de red durante la autenticación inicial: {e}. Verifica tu conexión a internet.")
+                return None
+            except Exception as e:
+                logger.error(f"Error inesperado durante la autenticación inicial: {e}.")
+                return None
+        
         # Guarda las credenciales actualizadas para futuras ejecuciones
-        with open('token.json', 'w') as token:
-            token.write(creds.to_json())
+        if creds and creds.valid:
+            try:
+                with open('token.json', 'w') as token:
+                    token.write(creds.to_json())
+            except Exception as e:
+                logger.error(f"Error al guardar el token de acceso en 'token.json': {e}.")
+    
     return creds
 
 # 🔧 Mejora 4: Soporte opcional para la API oficial de Google Drive
@@ -177,6 +210,11 @@ def download_file_with_api(file_id: str, output_path: str, chunk_size: int) -> t
 
     try:
         creds = get_google_drive_api_credentials()
+        if not creds: # Si no se pudieron obtener las credenciales, salir
+            status = "Failed (Auth Error)"
+            logger.error(f"No se pudieron obtener las credenciales de la API para el archivo {file_id}. Verifica 'credentials.json' y tu conexión.")
+            return False, file_name, total_size, start_time, status, sha256_hash_result
+
         service = build('drive', 'v3', credentials=creds)
 
         # Obtener metadatos del archivo para determinar el nombre y tamaño

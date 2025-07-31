@@ -222,7 +222,8 @@ def download_file_with_api(file_id: str, output_path: str, chunk_size: int) -> t
         # Usar io.FileIO para escribir directamente en el archivo y 'ab' para modo append binario
         fh = io.FileIO(full_output_path, 'ab') 
         # MediaIoBaseDownload maneja la descarga en chunks y la reanudación automáticamente
-        downloader = MediaIoBaseDownload(fh, request, chunksize=chunk_size, resumable=True)
+        # 🔧 Corrección de error: Eliminado 'resumable=True' del constructor
+        downloader = MediaIoBaseDownload(fh, request, chunksize=chunk_size)
 
         done = False
         with tqdm(total=total_size, unit='B', unit_scale=True, desc=file_name, initial=downloaded_bytes) as pbar:
@@ -240,7 +241,7 @@ def download_file_with_api(file_id: str, output_path: str, chunk_size: int) -> t
         if sha256_hash_result:
             sha256_file_path = f"{full_output_path}.sha256"
             with open(sha256_file_path, 'w') as f:
-                f.write(sha256_hash_result)
+                    f.write(sha256_hash_result)
             logger.info(f"SHA256 hash calculado y guardado para '{file_name}': {sha256_hash_result}")
 
         status = "Success"
@@ -668,7 +669,7 @@ def main():
     if valid_links_count == 0:
         logger.error("No se encontraron FILEIDs válidos de Google Drive en la entrada proporcionada. Saliendo.")
         # 🔧 Mejora 3: Modo Dry Run - Si no hay enlaces válidos y estamos en dry run, igual mostramos el resumen
-        if args.dry_run:
+        if args.dry_run: # Corrected from args.dry-run
             logger.info("\n--- Modo Dry Run Activado ---")
             logger.info(f"Se encontraron {valid_links_count} enlaces válidos para descargar.")
             if global_failed_original_links:
@@ -679,7 +680,7 @@ def main():
         return
 
     # 🔧 Mejora 3: Modo Dry Run - Si está activado, muestra el resumen y finaliza
-    if args.dry_run:
+    if args.dry_run: # Corrected from args.dry-run
         logger.info("\n--- Modo Dry Run Activado ---")
         logger.info(f"Se encontraron {valid_links_count} enlaces válidos para descargar.")
         if global_failed_original_links:
@@ -828,8 +829,9 @@ def main():
                     success, file_name, total_size, download_start_time, status, sha256_hash_result = \
                         download_file_with_api(file_id_for_log, DOWNLOAD_FOLDER, args.chunk_size)
                 else:
+                    # 🔧 Corrección de error: Pasar solo los 4 argumentos esperados a download_file_from_google_drive
                     success, file_name, total_size, download_start_time, status, sha256_hash_result = \
-                        download_file_from_google_drive(*task)
+                        download_file_from_google_drive(file_id_for_log, DOWNLOAD_FOLDER, args.retries, args.chunk_size)
                 
                 end_time = time.time()
                 duration = end_time - download_start_time

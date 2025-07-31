@@ -12,6 +12,23 @@ import hashlib # For SHA256 hash calculation
 import csv # For CSV summary output
 import json # For JSON summary output (alternative)
 
+# --- Dependencias para nuevas funcionalidades ---
+# Para la Mejora 4 (API oficial de Google Drive):
+# pip install google-api-python-client google-auth-oauthlib google-auth-httplib2
+from google.oauth2.credentials import Credentials
+from google_auth_oauthlib.flow import InstalledAppFlow
+from google.auth.transport.requests import Request
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseDownload
+import io # Necesario para MediaIoBaseDownload
+
+# Para la Mejora 5 (FastAPI):
+# pip install fastapi uvicorn
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel # Para validación de datos en FastAPI
+import uvicorn
+import threading # Para ejecutar descargas en un hilo separado en FastAPI
+
 # --- Configuration ---
 DOWNLOAD_FOLDER = "drive_downloads"  # Folder where files will be saved
 DEFAULT_MAX_RETRIES = 3             # Default maximum number of retries per download
@@ -31,7 +48,6 @@ console_handler.setFormatter(logging.Formatter('%(levelname)s: %(message)s'))
 logger.addHandler(console_handler)
 
 # --- Check for psutil availability and define PSUTIL_AVAILABLE globally ---
-# This block ensures PSUTIL_AVAILABLE is always defined, preventing NameError.
 try:
     import psutil
     PSUTIL_AVAILABLE = True
@@ -39,6 +55,13 @@ except ImportError:
     PSUTIL_AVAILABLE = False
     logger.warning("psutil not installed. Resource usage hints (memory) will be limited.")
 
+# --- Estado global para FastAPI (Mejora 5) ---
+app = FastAPI()
+# Estas listas y conjuntos globales serán actualizados por las funciones de descarga
+# y accesibles por los endpoints de FastAPI.
+global_download_summary_data = []
+global_failed_original_links = set()
+global_active_downloads = {} # Para rastrear descargas en curso para el endpoint de estado
 
 # --- Helper Functions ---
 
@@ -100,6 +123,135 @@ def calculate_sha256(file_path: str, chunk_size: int = DEFAULT_CHUNK_SIZE) -> st
         logger.error(f"Error calculating SHA256 for {file_path}: {e}")
         return None
 
+# 🔧 Mejora 4: Soporte opcional para la API oficial de Google Drive
+def get_google_drive_api_credentials():
+    """
+    Authenticates with Google Drive API using OAuth 2.0.
+    Stores/loads credentials from token.json.
+    """
+    # Define los ámbitos de acceso necesarios. drive.readonly permite solo descargar.
+    SCOPES = ['https://www.googleapis.com/auth/drive.readonly']
+    creds = None
+    # El archivo token.json almacena los tokens de acceso y refresco del usuario.
+    if os.path.exists('token.json'):
+        creds = Credentials.from_authorized_user_file('token.json', SCOPES)
+    # Si no hay credenciales válidas o no existen, se intenta refrescar o generar nuevas.
+    if not creds or not creds.valid:
+        if creds and creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+        else:
+            # El archivo credentials.json se descarga desde Google Cloud Console.
+            # Debe estar en el mismo directorio que este script.
+            flow = InstalledAppFlow.from_client_secrets_file(
+                'credentials.json', SCOPES)
+            creds = flow.run_local_server(port=0) # Inicia un servidor local para el flujo de autenticación
+        # Guarda las credenciales actualizadas para futuras ejecuciones
+        with open('token.json', 'w') as token:
+            token.write(creds.to_json())
+    return creds
+
+# 🔧 Mejora 4: Soporte opcional para la API oficial de Google Drive
+def download_file_with_api(file_id: str, output_path: str, chunk_size: int) -> tuple[bool, str, int, float, str, str | None]:
+    """
+    Downloads a file from Google Drive using the official API.
+
+    Args:
+        file_id (str): The ID of the Google Drive file.
+        output_path (str): The directory where the file will be saved.
+        chunk_size (int): Size of chunks for streaming download.
+
+    Returns:
+        tuple[bool, str, int, float, str, str | None]: A tuple containing:
+            - bool: True if download was successful, False otherwise.
+            - str: The determined file name.
+            - int: Total size of the file in bytes.
+            - float: Start time of the download process (time.time()).
+            - str: Status of the download ("Success", "Failed").
+            - str | None: SHA256 hash of the downloaded file, or None if not calculated/failed.
+    """
+    start_time = time.time()
+    file_name = f"{file_id}_api.bin" # Nombre por defecto, se actualizará con los metadatos de la API
+    total_size = 0
+    status = "Failed"
+    sha256_hash_result = None
+
+    try:
+        creds = get_google_drive_api_credentials()
+        service = build('drive', 'v3', credentials=creds)
+
+        # Obtener metadatos del archivo para determinar el nombre y tamaño
+        file_metadata = service.files().get(fileId=file_id, fields='name,size').execute()
+        file_name = file_metadata.get('name', file_name)
+        total_size = int(file_metadata.get('size', 0))
+
+        # Sanitizar el nombre del archivo
+        sanitized_file_name = "".join([c for c in file_name if c.isalnum() or c in ('.', '_', '-')])
+        if not sanitized_file_name:
+            sanitized_file_name = file_name
+
+        # 🔧 Mejora 1: Validación más robusta del nombre de archivo (aplicada también a API)
+        base_name, ext = os.path.splitext(sanitized_file_name)
+        unique_file_name = sanitized_file_name
+        counter = 0
+        while os.path.exists(os.path.join(output_path, unique_file_name)):
+            if counter == 0:
+                unique_file_name = f"{base_name}_{file_id}{ext}"
+            else:
+                unique_file_name = f"{base_name}_{file_id}_{counter}{ext}"
+            counter += 1
+        
+        full_output_path = os.path.join(output_path, unique_file_name)
+        file_name = unique_file_name # Actualiza file_name para el registro y el resumen
+
+        # 🔧 Mejora 1: Soporte para descargas reanudables (aplicado también a API)
+        downloaded_bytes = 0
+        if os.path.exists(full_output_path):
+            downloaded_bytes = os.path.getsize(full_output_path)
+            if downloaded_bytes == total_size and total_size > 0:
+                status = "Skipped"
+                sha256_hash_result = calculate_sha256(full_output_path, chunk_size)
+                logger.info(f"File '{file_name}' already fully downloaded via API. Skipping.")
+                return True, file_name, total_size, start_time, status, sha256_hash_result
+            elif downloaded_bytes > 0:
+                logger.info(f"Resuming download for '{file_name}' from {downloaded_bytes} bytes (API).")
+            else:
+                downloaded_bytes = 0 # Reiniciar si el archivo existe pero está vacío/corrupto
+
+        # Crear una solicitud para descargar el archivo
+        request = service.files().get_media(fileId=file_id)
+        # Usar io.FileIO para escribir directamente en el archivo y 'ab' para modo append binario
+        fh = io.FileIO(full_output_path, 'ab') 
+        # MediaIoBaseDownload maneja la descarga en chunks y la reanudación automáticamente
+        downloader = MediaIoBaseDownload(fh, request, chunksize=chunk_size, resumable=True)
+
+        done = False
+        with tqdm(total=total_size, unit='B', unit_scale=True, desc=file_name, initial=downloaded_bytes) as pbar:
+            while not done:
+                # next_chunk() devuelve el estado de la descarga y si ha terminado
+                status_api, done = downloader.next_chunk()
+                if status_api:
+                    # Actualiza la barra de progreso con el progreso real de la API
+                    pbar.update(status_api.resumable_progress - pbar.n) 
+        
+        fh.close() # Cerrar el manejador de archivo después de que la descarga esté completa
+
+        # Calcular hash SHA256 después de una descarga exitosa
+        sha256_hash_result = calculate_sha256(full_output_path, chunk_size)
+        if sha256_hash_result:
+            sha256_file_path = f"{full_output_path}.sha256"
+            with open(sha256_file_path, 'w') as f:
+                f.write(sha256_hash_result)
+            logger.info(f"SHA256 hash calculado y guardado para '{file_name}': {sha256_hash_result}")
+
+        status = "Success"
+        return True, file_name, total_size, start_time, status, sha256_hash_result
+
+    except Exception as e:
+        status = "Failed (API Error)"
+        logger.error(f"Error al descargar el archivo {file_id} con la API de Google Drive: {e}", exc_info=True)
+        return False, file_name, total_size, start_time, status, sha256_hash_result
+
+
 def download_file_from_google_drive(file_id: str, output_path: str, max_retries: int, chunk_size: int) -> tuple[bool, str, int, float, str, str | None]:
     """
     Downloads a file from Google Drive, handling large file confirmation,
@@ -131,81 +283,23 @@ def download_file_from_google_drive(file_id: str, output_path: str, max_retries:
 
     for retry_count in range(max_retries + 1):
         try:
-            # First attempt to get the file.
-            # This could be the direct download or the warning page.
-            # Added timeout to prevent hanging connections.
-            response = session.get(download_url, stream=True, timeout=30)
-            response.raise_for_status()  # Raises an exception for bad HTTP status codes
+            # Determine file name before checking for existence and resuming
+            # Make a HEAD request to get headers without downloading content
+            head_response = session.head(download_url, allow_redirects=True, timeout=10)
+            head_response.raise_for_status()
 
-            # --- Detect and handle Google Drive HTML responses (warning page or error) ---
-            if 'Content-Type' in response.headers and 'text/html' in response.headers['Content-Type']:
-                logger.info(f"Detected Google Drive HTML response for {file_id}. Checking for confirmation form or error messages.")
-                
-                soup = BeautifulSoup(response.text, 'html.parser')
-                download_form = soup.find('form', {'id': 'download-form'})
-
-                if download_form:
-                    # If a download form is found, it's the large file confirmation page.
-                    # Extract the action URL from the form, which will be the real download endpoint
-                    action_url = download_form.get('action')
-                    if not action_url.startswith('http'): # Ensure it's an absolute URL
-                        action_url = f"https://drive.google.com{action_url}"
-
-                    # Collect all hidden input fields from the form
-                    params = {}
-                    hidden_inputs = download_form.find_all('input', {'type': 'hidden'})
-                    for input_tag in hidden_inputs:
-                        name = input_tag.get('name')
-                        value = input_tag.get('value')
-                        if name and value:
-                            params[name] = value
-
-                    logger.info(f"Confirmation form found. Retrying download with form parameters for {file_id}.")
-                    
-                    # Make the second GET request to the action endpoint with all hidden parameters.
-                    # This simulates submitting the form and should initiate the binary download.
-                    response = session.get(action_url, params=params, stream=True, timeout=30)
-                    response.raise_for_status()
-                else:
-                    # If HTML is detected but the form is not found, check for specific error messages.
-                    # This implies it's likely a direct error page, not a confirmation page.
-                    page_text = response.text.lower()
-                    quota_keywords = ["quota exceeded", "limit exceeded", "excess traffic", "download limit", "virus scan warning"]
-                    is_quota_error = any(keyword in page_text for keyword in quota_keywords)
-
-                    if is_quota_error:
-                        status = "Failed (Quota Exceeded)"
-                        error_message = (
-                            f"[ERROR - QUOTA EXCEEDED] Could not download file with ID: {file_id}\n"
-                            f"➤ Reason: Google Drive has temporarily blocked the download due to excessive traffic or virus scan warning.\n"
-                            f"➤ Solution: Make a copy of the file to your personal Google Drive account and use its new ID for download.\n"
-                            f"➤ Note: If a .bin file was created, it is NOT the original file, but an automatic error response from Google."
-                        )
-                        logger.error(error_message)
-                        # Do not proceed with saving the .bin file in this case
-                        return False, file_name, total_size, start_time, status, sha256_hash_result
-                    else:
-                        # Generic HTML error page, not specifically quota or virus warning
-                        logger.warning(f"HTML page detected for {file_id}, but no download form or specific quota/virus warning text was found. This might indicate a change in Google Drive's warning page or an access issue.")
-                        raise requests.exceptions.RequestException("Download form not found or unrecognized HTML warning page.")
-
-            # --- Determine file name before checking for existence ---
-            # Attempt to extract the file name from Content-Disposition,
-            # which is the preferred method for getting the original name.
-            if 'Content-Disposition' in response.headers:
-                fname_match = re.search(r'filename\*?=UTF-8\'\'(.+)', response.headers['Content-Disposition'])
+            if 'Content-Disposition' in head_response.headers:
+                fname_match = re.search(r'filename\*?=UTF-8\'\'(.+)', head_response.headers['Content-Disposition'])
                 if fname_match:
                     file_name = requests.utils.unquote(fname_match.group(1))
                 else:
-                    fname_match = re.search(r'filename="([^"]+)"', response.headers['Content-Disposition'])
+                    fname_match = re.search(r'filename="([^"]+)"', head_response.headers['Content-Disposition'])
                     if fname_match:
                         file_name = fname_match.group(1)
             
-            # Use a sanitized file name for path construction
-            # Remove characters that are not alphanumeric, '.', '_', or '-'
             sanitized_file_name = "".join([c for c in file_name if c.isalnum() or c in ('.', '_', '-')])
-            if not sanitized_file_name: # Fallback if sanitization makes it empty
-                sanitized_file_name = file_name # Use original if sanitized is empty, might cause issues but better than no name
+            if not sanitized_file_name:
+                sanitized_file_name = file_name
             
             # 🔧 Mejora 1: Validación más robusta del nombre de archivo
             # Asegura que el nombre de archivo sea único en la carpeta de descarga
@@ -225,25 +319,88 @@ def download_file_from_google_drive(file_id: str, output_path: str, max_retries:
             full_output_path = os.path.join(output_path, unique_file_name)
             file_name = unique_file_name # Actualiza file_name para el registro y el resumen
 
-            # --- Check if file already exists and skip if so ---
-            if os.path.exists(full_output_path) and os.path.getsize(full_output_path) > 0:
-                status = "Skipped"
-                # If skipped, try to calculate SHA256 from existing file
-                sha256_hash_result = calculate_sha256(full_output_path, chunk_size)
-                logger.info(f"File '{sanitized_file_name}' already exists in '{output_path}'. Skipping download.")
-                return True, sanitized_file_name, os.path.getsize(full_output_path), start_time, status, sha256_hash_result
-
-            # --- Continue with normal download flow ---
-            total_size = int(response.headers.get('content-length', 0))
-
+            # 🔧 Mejora 1: Soporte para descargas reanudables
+            headers = {}
             downloaded_bytes = 0
+            # Si el archivo ya existe, intentamos reanudar la descarga
+            if os.path.exists(full_output_path):
+                downloaded_bytes = os.path.getsize(full_output_path)
+                if downloaded_bytes > 0:
+                    headers['Range'] = f'bytes={downloaded_bytes}-' # Solicita bytes desde el tamaño existente
+                    logger.info(f"Reanudando descarga para '{file_name}' desde {downloaded_bytes} bytes.")
+                
+            # Primera solicitud GET para obtener el archivo.
+            # Esto podría ser la descarga directa o la página de advertencia.
+            response = session.get(download_url, stream=True, headers=headers, timeout=30)
+            response.raise_for_status()  # Lanza una excepción para códigos de estado HTTP erróneos
+
+            # Verificar si el servidor honró la cabecera Range
+            if response.status_code == 206: # Contenido Parcial
+                logger.info(f"El servidor honró la cabecera Range para '{file_name}'. Reanudando.")
+            elif downloaded_bytes > 0 and response.status_code == 200: # Contenido completo, pero pedimos parcial
+                logger.warning(f"El servidor NO honró la cabecera Range para '{file_name}'. Reiniciando descarga desde el principio.")
+                downloaded_bytes = 0 # Reiniciar a 0 para empezar de cero
+            
+            # --- Detectar y manejar respuestas HTML de Google Drive (página de advertencia o error) ---
+            if 'Content-Type' in response.headers and 'text/html' in response.headers['Content-Type']:
+                logger.info(f"Se detectó respuesta HTML de Google Drive para {file_id}. Verificando formulario de confirmación o mensajes de error.")
+                
+                soup = BeautifulSoup(response.text, 'html.parser')
+                download_form = soup.find('form', {'id': 'download-form'})
+
+                if download_form:
+                    # Si se encuentra un formulario de descarga, es la página de confirmación de archivo grande.
+                    action_url = download_form.get('action')
+                    if not action_url.startswith('http'): # Asegurarse de que sea una URL absoluta
+                        action_url = f"https://drive.google.com{action_url}"
+
+                    # Recolectar todos los campos de entrada ocultos del formulario
+                    params = {}
+                    hidden_inputs = download_form.find_all('input', {'type': 'hidden'})
+                    for input_tag in hidden_inputs:
+                        name = input_tag.get('name')
+                        value = input_tag.get('value')
+                        if name and value:
+                            params[name] = value
+
+                    logger.info(f"Formulario de confirmación encontrado. Reintentando descarga con parámetros del formulario para {file_id}.")
+                    
+                    # Hacer la segunda solicitud GET al endpoint de acción con todos los parámetros ocultos.
+                    # Esto simula el envío del formulario y debería iniciar la descarga binaria.
+                    response = session.get(action_url, params=params, stream=True, headers=headers, timeout=30) # Pasar las cabeceras de nuevo
+                    response.raise_for_status()
+                else:
+                    # Si se detecta HTML pero no se encuentra el formulario, verificar mensajes de error específicos.
+                    page_text = response.text.lower()
+                    quota_keywords = ["quota exceeded", "limit exceeded", "excess traffic", "download limit", "virus scan warning"]
+                    is_quota_error = any(keyword in page_text for keyword in quota_keywords)
+
+                    if is_quota_error:
+                        status = "Failed (Quota Exceeded)"
+                        error_message = (
+                            f"[ERROR - CUOTA EXCEDIDA] No se pudo descargar el archivo con ID: {file_id}\n"
+                            f"➤ Razón: Google Drive ha bloqueado temporalmente la descarga debido a tráfico excesivo o advertencia de escaneo de virus.\n"
+                            f"➤ Solución: Haz una copia del archivo en tu cuenta personal de Google Drive y usa su nuevo ID para la descarga.\n"
+                            f"➤ Nota: Si se creó un archivo .bin, NO es el archivo original, sino una respuesta de error automática de Google."
+                        )
+                        logger.error(error_message)
+                        return False, file_name, total_size, start_time, status, sha256_hash_result
+                    else:
+                        logger.warning(f"Página HTML detectada para {file_id}, pero no se encontró formulario de descarga o texto específico de advertencia de cuota/virus. Esto podría indicar un cambio en la página de advertencia de Google Drive o un problema de acceso.")
+                        raise requests.exceptions.RequestException("Formulario de descarga no encontrado o página de advertencia HTML no reconocida.")
+
+            # --- Continuar con el flujo normal de descarga ---
+            # Sumar los bytes ya descargados al tamaño total esperado para la barra de progreso
+            total_size = int(response.headers.get('content-length', 0)) + downloaded_bytes 
+
             last_throughput_check_time = time.time()
             bytes_since_last_check = 0
             low_throughput_start_time = None
 
-            with open(full_output_path, 'wb') as f:
-                # Use tqdm to show a download progress bar
-                with tqdm(total=total_size, unit='B', unit_scale=True, desc=sanitized_file_name) as pbar:
+            # 🔧 Mejora 1: Soporte para descargas reanudables - Abrir en modo append binario ('ab')
+            with open(full_output_path, 'ab') as f:
+                # Usar tqdm para mostrar una barra de progreso de descarga
+                with tqdm(total=total_size, unit='B', unit_scale=True, desc=file_name, initial=downloaded_bytes) as pbar:
                     for chunk in response.iter_content(chunk_size=chunk_size):
                         if chunk:
                             f.write(chunk)
@@ -252,8 +409,8 @@ def download_file_from_google_drive(file_id: str, output_path: str, max_retries:
                             bytes_since_last_check += len(chunk)
 
                             current_time = time.time()
-                            # Check throughput every few seconds
-                            if current_time - last_throughput_check_time >= 5: # Check every 5 seconds
+                            # La lógica de verificación de rendimiento permanece igual
+                            if current_time - last_throughput_check_time >= 5: # Verificar cada 5 segundos
                                 elapsed_check_time = current_time - last_throughput_check_time
                                 current_throughput = bytes_since_last_check / elapsed_check_time if elapsed_check_time > 0 else 0
 
@@ -261,44 +418,40 @@ def download_file_from_google_drive(file_id: str, output_path: str, max_retries:
                                     if low_throughput_start_time is None:
                                         low_throughput_start_time = current_time
                                     elif current_time - low_throughput_start_time >= LOW_THROUGHPUT_TIMEOUT:
-                                        logger.warning(f"Low throughput detected for '{sanitized_file_name}' ({current_throughput:.2f} B/s). Download might be slow or stuck.")
-                                        # Reset low_throughput_start_time to avoid repeated warnings for the same continuous low throughput
+                                        logger.warning(f"Rendimiento bajo detectado para '{file_name}' ({current_throughput:.2f} B/s). La descarga podría ser lenta o estar atascada.")
                                         low_throughput_start_time = current_time 
                                 else:
-                                    low_throughput_start_time = None # Reset if throughput recovers
+                                    low_throughput_start_time = None 
 
                                 last_throughput_check_time = current_time
                                 bytes_since_last_check = 0
             
-            # --- Calculate SHA256 hash after successful download ---
+            # Calcular hash SHA256 después de una descarga exitosa
             sha256_hash_result = calculate_sha256(full_output_path, chunk_size)
             if sha256_hash_result:
                 sha256_file_path = f"{full_output_path}.sha256"
                 with open(sha256_file_path, 'w') as f:
                     f.write(sha256_hash_result)
-                logger.info(f"SHA256 hash calculated and saved for '{sanitized_file_name}': {sha256_hash_result}")
+                logger.info(f"SHA256 hash calculado y guardado para '{file_name}': {sha256_hash_result}")
 
             status = "Success"
-            return True, sanitized_file_name, total_size, start_time, status, sha256_hash_result
+            return True, file_name, total_size, start_time, status, sha256_hash_result
 
         except (requests.exceptions.RequestException, requests.exceptions.Timeout) as e:
-            # Handle network errors, HTTP errors, and timeouts with exponential retries
-            logger.error(f"Error on attempt {retry_count + 1} for {file_id} ('{file_name}'): {e}")
+            logger.error(f"Error en el intento {retry_count + 1} para {file_id} ('{file_name}'): {e}")
             if retry_count < max_retries:
                 wait_time = RETRY_BACKOFF_FACTOR * (2 ** retry_count)
-                logger.info(f"Retrying in {wait_time} seconds...")
+                logger.info(f"Reintentando en {wait_time} segundos...")
                 time.sleep(wait_time)
             else:
                 status = "Failed (Max Retries)"
-                logger.error(f"Final failure: Could not download {file_id} ('{file_name}') after {max_retries} retries.")
+                logger.error(f"Fallo final: No se pudo descargar {file_id} ('{file_name}') después de {max_retries} reintentos.")
                 return False, file_name, total_size, start_time, status, sha256_hash_result
         except Exception as e:
-            # Catch any other unexpected exceptions
             status = "Failed (Unexpected Error)"
-            logger.critical(f"Unexpected error while downloading {file_id} ('{file_name}'): {e}", exc_info=True)
+            logger.critical(f"Error inesperado al descargar {file_id} ('{file_name}'): {e}", exc_info=True)
             return False, file_name, total_size, start_time, status, sha256_hash_result
     
-    # This part is reached if all retries fail
     return False, file_name, total_size, start_time, status, sha256_hash_result
 
 # --- Main Function ---
@@ -308,7 +461,7 @@ def main():
     Main function to parse arguments, read links, and manage the download process.
     Handles parallel downloads, logging, and graceful shutdown.
     """
-    start_total_process_time = time.time() # Start total process timer
+    start_total_process_time = time.time() # Iniciar el temporizador del proceso total
 
     parser = argparse.ArgumentParser(description="Google Drive Downloader Script.")
     parser.add_argument("--workers", type=int, default=DEFAULT_MAX_PARALLEL_DOWNLOADS,
@@ -322,13 +475,20 @@ def main():
     # 🔧 Mejora 3: Modo Dry Run
     parser.add_argument("--dry-run", action="store_true",
                         help="If set, the script will only validate links and show a summary, without downloading any files.")
+    # 🔧 Mejora 4: Soporte opcional para la API oficial de Google Drive
+    parser.add_argument("--use-api", action="store_true",
+                        help="Use the official Google Drive API for downloads (requires credentials.json and token.json).")
+    # 🔧 Mejora 5: Modo servidor API REST
+    parser.add_argument("--serve", action="store_true",
+                        help="Run the script as a FastAPI server.")
+    parser.add_argument("--port", type=int, default=8000,
+                        help="Port for the FastAPI server (default: 8000).")
     args = parser.parse_args()
 
-    # --- Ensure the download folder exists before configuring the logger ---
-    # This prevents FileNotFoundError when setting up RotatingFileHandler if the folder doesn't exist.
+    # --- Asegurar que la carpeta de descarga existe antes de configurar el logger ---
     os.makedirs(DOWNLOAD_FOLDER, exist_ok=True)
     
-    # Reconfigure file handler with the correct path after folder creation
+    # Reconfigurar el manejador de archivos con la ruta correcta después de crear la carpeta
     log_file_path = os.path.join(DOWNLOAD_FOLDER, "downloads.log")
     for handler in logger.handlers:
         if isinstance(handler, RotatingFileHandler):
@@ -337,17 +497,16 @@ def main():
     file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
     logger.addHandler(file_handler)
 
-    logger.info("--- Starting Google Drive Downloader ---")
-    logger.info(f"Files will be saved in: '{os.path.abspath(DOWNLOAD_FOLDER)}'")
-    logger.info(f"Configured for {args.workers} parallel downloads.")
-    logger.info(f"Using chunk size: {args.chunk_size} bytes.")
-    logger.info(f"Max retries per file: {args.retries}.")
+    logger.info("--- Iniciando Google Drive Downloader ---")
+    logger.info(f"Los archivos se guardarán en: '{os.path.abspath(DOWNLOAD_FOLDER)}'")
+    logger.info(f"Configurado para {args.workers} descargas paralelas.")
+    logger.info(f"Usando tamaño de chunk: {args.chunk_size} bytes.")
+    logger.info(f"Máximo de reintentos por archivo: {args.retries}.")
 
-    # Log resource usage hints
-    logger.info(f"System CPU cores detected: {os.cpu_count()}")
+    logger.info(f"Núcleos de CPU del sistema detectados: {os.cpu_count()}")
     if PSUTIL_AVAILABLE:
         total_memory_bytes = psutil.virtual_memory().total
-        logger.info(f"Total system memory: {total_memory_bytes / (1024**3):.2f} GB")
+        logger.info(f"Memoria total del sistema: {total_memory_bytes / (1024**3):.2f} GB")
     
     # 🔧 Mejora 2: Verificación de conexión a Google Drive antes de iniciar
     logger.info("Verificando conexión a Google Drive...")
@@ -359,65 +518,162 @@ def main():
         logger.error(f"Error de conexión a Google Drive: No se pudo conectar a https://drive.google.com. Por favor, verifica tu conexión a internet. Error: {e}")
         return # Finaliza el script si la conexión falla
 
-    # Read links from a text file or in-memory list
+    # 🔧 Mejora 5: Modo servidor API REST - Lanzar el servidor FastAPI si --serve está activo
+    if args.serve:
+        logger.info(f"Iniciando servidor FastAPI en http://0.0.0.0:{args.port}")
+        # Hacer que las variables globales sean accesibles para las rutas de FastAPI.
+        # Esta es una forma simple de compartir el estado para este ejemplo.
+        # Para aplicaciones más complejas, considere la inyección de dependencias de FastAPI o un patrón de gestión de estado dedicado.
+        app.state.download_summary_data = global_download_summary_data
+        app.state.failed_original_links = global_failed_original_links
+        app.state.active_downloads = global_active_downloads
+        app.state.download_args = args # Pasar argumentos CLI al contexto del servidor
+
+        # Definir modelos de Pydantic para la entrada de la API
+        class DownloadRequest(BaseModel):
+            link: str
+
+        # Endpoint para iniciar una descarga
+        @app.post("/download")
+        async def api_download(request: DownloadRequest):
+            link = request.link
+            file_id = extract_file_id(link)
+            if not file_id:
+                raise HTTPException(status_code=400, detail="Enlace de Google Drive inválido o ID de archivo no encontrado.")
+            
+            # Generar un ID único para esta solicitud de descarga
+            request_id = str(time.time()).replace('.', '') # ID único simple
+            global_active_downloads[request_id] = {"status": "pending", "file_id": file_id, "link": link, "progress": 0, "file_name": "N/A"}
+            
+            # Función para ejecutar la descarga en un hilo separado
+            def run_download_task():
+                try:
+                    # Usar la API o el método de scraping basado en el argumento --use-api
+                    if app.state.download_args.use_api:
+                        success, file_name, total_size, download_start_time, status, sha256_hash_result = \
+                            download_file_with_api(file_id, DOWNLOAD_FOLDER, app.state.download_args.chunk_size)
+                    else:
+                        success, file_name, total_size, download_start_time, status, sha256_hash_result = \
+                            download_file_from_google_drive(file_id, DOWNLOAD_FOLDER, app.state.download_args.retries, app.state.download_args.chunk_size)
+                    
+                    end_time = time.time()
+                    duration = end_time - download_start_time
+                    avg_speed = (total_size / duration) if duration > 0 else 0
+
+                    summary_entry = {
+                        'file_id': file_id,
+                        'filename': file_name,
+                        'status': status,
+                        'size_bytes': total_size,
+                        'duration_seconds': round(duration, 2),
+                        'sha256_hash': sha256_hash_result if sha256_hash_result else 'N/A'
+                    }
+                    global_download_summary_data.append(summary_entry)
+                    if not success:
+                        global_failed_original_links.add(link)
+                    
+                    # Actualizar el estado de la descarga activa
+                    global_active_downloads[request_id].update({
+                        "status": "completed" if success else "failed",
+                        "file_name": file_name,
+                        "total_size": total_size,
+                        "duration": duration,
+                        "avg_speed": avg_speed,
+                        "sha256": sha256_hash_result,
+                        "progress": 100
+                    })
+                    logger.info(f"Descarga API completada para {file_id}: {status}")
+
+                except Exception as e:
+                    logger.error(f"Error durante la descarga API para {file_id}: {e}", exc_info=True)
+                    global_active_downloads[request_id].update({"status": "error", "message": str(e), "progress": 0})
+                    global_failed_original_links.add(link)
+
+            # Iniciar la descarga en un hilo separado
+            threading.Thread(target=run_download_task).start()
+            return {"message": "Descarga iniciada", "file_id": file_id, "request_id": request_id}
+
+        # Endpoint para obtener el estado de las descargas activas
+        @app.get("/status")
+        async def api_status():
+            return {"active_downloads": global_active_downloads}
+
+        # Endpoint para obtener el resumen de descargas
+        @app.get("/summary")
+        async def api_summary():
+            summary_json_path = os.path.join(DOWNLOAD_FOLDER, "download_summary.json")
+            if os.path.exists(summary_json_path):
+                try:
+                    with open(summary_json_path, 'r', encoding='utf-8') as f:
+                        return json.load(f)
+                except Exception as e:
+                    raise HTTPException(status_code=500, detail=f"Error al leer el archivo de resumen: {e}")
+            raise HTTPException(status_code=404, detail="Resumen de descargas no encontrado.")
+
+        # Iniciar el servidor Uvicorn
+        uvicorn.run(app, host="0.0.0.0", port=args.port)
+        return # Salir de main después de iniciar el servidor
+
+    # --- El flujo CLI original continúa aquí si --serve NO está activo ---
+
+    # Leer enlaces de un archivo de texto o de la lista en memoria
     drive_links = []
     if args.input_file:
         file_path = args.input_file
-        # Validate input file existence and readability
         if not os.path.exists(file_path):
-            logger.error(f"Error: Input file '{file_path}' not found. Please provide a valid path.")
+            logger.error(f"Error: Archivo de entrada '{file_path}' no encontrado. Por favor, proporciona una ruta válida.")
             return
+        # 🔧 Corrección de error: 'os.path.access' a 'os.access'
         if not os.access(file_path, os.R_OK):
-            logger.error(f"Error: Input file '{file_path}' is not readable. Check permissions.")
+            logger.error(f"Error: Archivo de entrada '{file_path}' no se puede leer. Verifica los permisos.")
             return
         try:
             with open(file_path, 'r') as f:
                 drive_links = [line.strip() for line in f if line.strip()]
-            logger.info(f"Loaded {len(drive_links)} links from '{file_path}'.")
+            logger.info(f"Cargados {len(drive_links)} enlaces desde '{file_path}'.")
         except Exception as e:
-            logger.error(f"Error reading input file '{file_path}': {e}")
+            logger.error(f"Error al leer el archivo de entrada '{file_path}': {e}")
             return
     else:
-        print("Enter Google Drive links (one per line). Press Enter twice to finish:")
+        print("Ingresa los enlaces de Google Drive (uno por línea). Presiona Enter dos veces para finalizar:")
         while True:
             link = input()
             if not link:
                 break
             drive_links.append(link.strip())
-        logger.info(f"Entered {len(drive_links)} links.")
+        logger.info(f"Ingresados {len(drive_links)} enlaces.")
 
     if not drive_links:
-        logger.error("No links provided for download. Exiting.")
+        logger.error("No se proporcionaron enlaces para descargar. Saliendo.")
         return
 
-    # Process links and validate FILEIDs
+    # Procesar enlaces y validar FILEIDs
     download_tasks = []
-    valid_links_found = False
-    failed_original_links = set() # Set to store unique failed original links
-
+    valid_links_count = 0
+    
     for link in drive_links:
         if not is_valid_drive_link(link):
-            logger.warning(f"Invalid Google Drive link format: {link}. It will be skipped.")
-            failed_original_links.add(link) # Add invalid links to failed list
+            logger.warning(f"Formato de enlace de Google Drive inválido: {link}. Será omitido.")
+            global_failed_original_links.add(link)
             continue
 
         file_id = extract_file_id(link)
         if file_id:
-            download_tasks.append((file_id, DOWNLOAD_FOLDER, args.retries, args.chunk_size, link)) # Pass original link
-            valid_links_found = True
+            download_tasks.append((file_id, DOWNLOAD_FOLDER, args.retries, args.chunk_size, link))
+            valid_links_count += 1
         else:
-            logger.warning(f"Could not extract FILEID from URL: {link}. It will be skipped.")
-            failed_original_links.add(link) # Add links with unextractable IDs to failed list
+            logger.warning(f"No se pudo extraer el FILEID de la URL: {link}. Será omitido.")
+            global_failed_original_links.add(link)
 
-    if not valid_links_found:
-        logger.error("No valid Google Drive FILEIDs found in the provided input. Exiting.")
+    if valid_links_count == 0:
+        logger.error("No se encontraron FILEIDs válidos de Google Drive en la entrada proporcionada. Saliendo.")
         # 🔧 Mejora 3: Modo Dry Run - Si no hay enlaces válidos y estamos en dry run, igual mostramos el resumen
         if args.dry_run:
             logger.info("\n--- Modo Dry Run Activado ---")
-            logger.info(f"Se encontraron {len(download_tasks)} enlaces válidos para descargar.")
-            if failed_original_links:
-                logger.info(f"Se encontraron {len(failed_original_links)} enlaces inválidos o con ID no extraíble:")
-                for link in sorted(list(failed_original_links)):
+            logger.info(f"Se encontraron {valid_links_count} enlaces válidos para descargar.")
+            if global_failed_original_links:
+                logger.info(f"Se encontraron {len(global_failed_original_links)} enlaces inválidos o con ID no extraíble:")
+                for link in sorted(list(global_failed_original_links)):
                     logger.info(f"  - {link}")
             logger.info("El script finalizará sin realizar descargas.")
         return
@@ -425,48 +681,54 @@ def main():
     # 🔧 Mejora 3: Modo Dry Run - Si está activado, muestra el resumen y finaliza
     if args.dry_run:
         logger.info("\n--- Modo Dry Run Activado ---")
-        logger.info(f"Se encontraron {len(download_tasks)} enlaces válidos para descargar.")
-        if failed_original_links:
-            logger.info(f"Se encontraron {len(failed_original_links)} enlaces inválidos o con ID no extraíble:")
-            for link in sorted(list(failed_original_links)):
+        logger.info(f"Se encontraron {valid_links_count} enlaces válidos para descargar.")
+        if global_failed_original_links:
+            logger.info(f"Se encontraron {len(global_failed_original_links)} enlaces inválidos o con ID no extraíble:")
+            for link in sorted(list(global_failed_original_links)):
                 logger.info(f"  - {link}")
         logger.info("El script finalizará sin realizar descargas.")
         return
 
-    # Download in parallel if configured
-    completed_downloads = []
-    failed_downloads = []
-    download_summary_data = [] # List to store data for CSV/JSON summary
+    # Descargar en paralelo si está configurado
+    completed_downloads_count = 0
+    failed_downloads_count = 0
 
     if args.workers > 1:
-        logger.info(f"\nStarting parallel downloads ({args.workers} threads)...")
+        logger.info(f"\nIniciando descargas paralelas ({args.workers} hilos)...")
         with ThreadPoolExecutor(max_workers=args.workers) as executor:
-            # Map file_id to original link for better logging on exceptions
-            future_to_task = {executor.submit(download_file_from_google_drive, task[0], task[1], task[2], task[3]): task for task in download_tasks}
+            future_to_task = {}
+            for task in download_tasks:
+                file_id, output_folder, retries, chunk_size, original_link = task
+                if args.use_api:
+                    future = executor.submit(download_file_with_api, file_id, output_folder, chunk_size)
+                else:
+                    future = executor.submit(download_file_from_google_drive, file_id, output_folder, retries, chunk_size)
+                future_to_task[future] = task # Mapear el futuro de vuelta a la tupla de la tarea original
+
             try:
                 for future in as_completed(future_to_task):
-                    original_link = future_to_task[future][4] # Retrieve original link
+                    original_link = future_to_task[future][4]
                     file_id_for_log = future_to_task[future][0]
                     try:
                         success, file_name, total_size, download_start_time, status, sha256_hash_result = future.result()
                         end_time = time.time()
                         duration = end_time - download_start_time
-                        avg_speed = (total_size / duration) if duration > 0 else 0 # bytes/sec
+                        avg_speed = (total_size / duration) if duration > 0 else 0
 
                         log_message = (
-                            f"Download Finished: ID={file_id_for_log} | Name='{file_name}' | Status: {status} | "
-                            f"Duration: {duration:.2f}s | Size: {total_size} bytes | "
-                            f"Avg Speed: {avg_speed / 1024:.2f} KB/s"
+                            f"Descarga Finalizada: ID={file_id_for_log} | Nombre='{file_name}' | Estado: {status} | "
+                            f"Duración: {duration:.2f}s | Tamaño: {total_size} bytes | "
+                            f"Velocidad Promedio: {avg_speed / 1024:.2f} KB/s"
                         )
                         if success:
                             logger.info(log_message)
-                            completed_downloads.append(file_name)
+                            completed_downloads_count += 1
                         else:
                             logger.error(log_message)
-                            failed_downloads.append(file_name)
-                            failed_original_links.add(original_link) # Add to failed links set
+                            failed_downloads_count += 1
+                            global_failed_original_links.add(original_link)
                         
-                        download_summary_data.append({
+                        global_download_summary_data.append({
                             'file_id': file_id_for_log,
                             'filename': file_name,
                             'status': status,
@@ -475,21 +737,20 @@ def main():
                             'sha256_hash': sha256_hash_result if sha256_hash_result else 'N/A'
                         })
                     except Exception as exc:
-                        logger.critical(f"Task for {file_id_for_log} (Link: {original_link}) generated an exception: {exc}", exc_info=True)
-                        failed_downloads.append(file_id_for_log) # Log as failed if exception during result retrieval
-                        failed_original_links.add(original_link) # Add to failed links set
-                        download_summary_data.append({
+                        logger.critical(f"La tarea para {file_id_for_log} (Enlace: {original_link}) generó una excepción: {exc}", exc_info=True)
+                        failed_downloads_count += 1
+                        global_failed_original_links.add(original_link)
+                        global_download_summary_data.append({
                             'file_id': file_id_for_log,
-                            'filename': 'N/A', # File name might not be determined on exception
-                            'status': 'Failed (Exception)',
+                            'filename': 'N/A',
+                            'status': 'Fallo (Excepción)',
                             'size_bytes': 0,
-                            'duration_seconds': round(time.time() - download_start_time, 2),
+                            'duration_seconds': round(time.time() - start_total_process_time, 2), # Usar el tiempo total de inicio si download_start_time no es preciso
                             'sha256_hash': 'N/A'
                         })
             except KeyboardInterrupt:
-                logger.warning("KeyboardInterrupt detected. Shutting down executor gracefully...")
-                executor.shutdown(wait=False, cancel_futures=True) # Cancel remaining futures
-                # Collect results for futures that completed before shutdown
+                logger.warning("KeyboardInterrupt detectado. Cerrando el ejecutor de forma elegante...")
+                executor.shutdown(wait=False, cancel_futures=True)
                 for future in future_to_task:
                     original_link = future_to_task[future][4]
                     file_id_for_log = future_to_task[future][0]
@@ -501,18 +762,18 @@ def main():
                             avg_speed = (total_size / duration) if duration > 0 else 0
 
                             log_message = (
-                                f"Download Finished (Interrupted): ID={file_id_for_log} | Name='{file_name}' | Status: {status} | "
-                                f"Duration: {duration:.2f}s | Size: {total_size} bytes | "
-                                f"Avg Speed: {avg_speed / 1024:.2f} KB/s"
+                                f"Descarga Finalizada (Interrumpida): ID={file_id_for_log} | Nombre='{file_name}' | Estado: {status} | "
+                                f"Duración: {duration:.2f}s | Tamaño: {total_size} bytes | "
+                                f"Velocidad Promedio: {avg_speed / 1024:.2f} KB/s"
                             )
                             if success:
                                 logger.info(log_message)
-                                completed_downloads.append(file_name)
+                                completed_downloads_count += 1
                             else:
                                 logger.error(log_message)
-                                failed_downloads.append(file_name)
-                                failed_original_links.add(original_link)
-                            download_summary_data.append({
+                                failed_downloads_count += 1
+                                global_failed_original_links.add(original_link)
+                            global_download_summary_data.append({
                                 'file_id': file_id_for_log,
                                 'filename': file_name,
                                 'status': status,
@@ -521,67 +782,73 @@ def main():
                                 'sha256_hash': sha256_hash_result if sha256_hash_result else 'N/A'
                             })
                         except Exception as exc:
-                            logger.critical(f"Interrupted task for {file_id_for_log} (Link: {original_link}) generated an exception: {exc}", exc_info=True)
-                            failed_downloads.append(file_id_for_log)
-                            failed_original_links.add(original_link)
-                            download_summary_data.append({
+                            logger.critical(f"Tarea interrumpida para {file_id_for_log} (Enlace: {original_link}) generó una excepción: {exc}", exc_info=True)
+                            failed_downloads_count += 1
+                            global_failed_original_links.add(original_link)
+                            global_download_summary_data.append({
                                 'file_id': file_id_for_log,
                                 'filename': 'N/A',
-                                'status': 'Failed (Interrupted Exception)',
+                                'status': 'Fallo (Excepción Interrumpida)',
                                 'size_bytes': 0,
-                                'duration_seconds': round(time.time() - download_start_time, 2),
+                                'duration_seconds': round(time.time() - start_total_process_time, 2),
                                 'sha256_hash': 'N/A'
                             })
                     elif future.cancelled():
-                        logger.info(f"Download for {file_id_for_log} (Link: {original_link}) was cancelled due to interruption.")
-                        failed_downloads.append(file_id_for_log) # Consider cancelled as failed for summary
-                        failed_original_links.add(original_link)
-                        download_summary_data.append({
+                        logger.info(f"Descarga para {file_id_for_log} (Enlace: {original_link}) fue cancelada debido a interrupción.")
+                        failed_downloads_count += 1 # Considerar cancelada como fallida para el resumen
+                        global_failed_original_links.add(original_link)
+                        global_download_summary_data.append({
                             'file_id': file_id_for_log,
                             'filename': 'N/A',
-                            'status': 'Cancelled',
+                            'status': 'Cancelada',
                             'size_bytes': 0,
                             'duration_seconds': 0,
                             'sha256_hash': 'N/A'
                         })
                     elif not future.done():
-                        logger.info(f"Download for {file_id_for_log} (Link: {original_link}) was still running and not completed.")
-                        failed_downloads.append(file_id_for_log) # Consider incomplete as failed for summary
-                        failed_original_links.add(original_link)
-                        download_summary_data.append({
+                        logger.info(f"Descarga para {file_id_for_log} (Enlace: {original_link}) aún estaba en curso y no se completó.")
+                        failed_downloads_count += 1 # Considerar incompleta como fallida para el resumen
+                        global_failed_original_links.add(original_link)
+                        global_download_summary_data.append({
                             'file_id': file_id_for_log,
                             'filename': 'N/A',
-                            'status': 'Incomplete (Interrupted)',
+                            'status': 'Incompleta (Interrumpida)',
                             'size_bytes': 0,
                             'duration_seconds': 0,
                             'sha256_hash': 'N/A'
                         })
-                logger.info("Executor shutdown complete.")
+                logger.info("Cierre del ejecutor completado.")
     else:
-        logger.info("\nStarting sequential downloads...")
+        logger.info("\nIniciando descargas secuenciales...")
         for task in download_tasks:
             original_link = task[4]
             file_id_for_log = task[0]
             try:
-                success, file_name, total_size, download_start_time, status, sha256_hash_result = download_file_from_google_drive(*task)
+                if args.use_api:
+                    success, file_name, total_size, download_start_time, status, sha256_hash_result = \
+                        download_file_with_api(file_id_for_log, DOWNLOAD_FOLDER, args.chunk_size)
+                else:
+                    success, file_name, total_size, download_start_time, status, sha256_hash_result = \
+                        download_file_from_google_drive(*task)
+                
                 end_time = time.time()
                 duration = end_time - download_start_time
                 avg_speed = (total_size / duration) if duration > 0 else 0
 
                 log_message = (
-                    f"Download Finished: ID={file_id_for_log} | Name='{file_name}' | Status: {status} | "
-                    f"Duration: {duration:.2f}s | Size: {total_size} bytes | "
-                    f"Avg Speed: {avg_speed / 1024:.2f} KB/s"
+                    f"Descarga Finalizada: ID={file_id_for_log} | Nombre='{file_name}' | Estado: {status} | "
+                    f"Duración: {duration:.2f}s | Tamaño: {total_size} bytes | "
+                    f"Velocidad Promedio: {avg_speed / 1024:.2f} KB/s"
                 )
                 if success:
                     logger.info(log_message)
-                    completed_downloads.append(file_name)
+                    completed_downloads_count += 1
                 else:
                     logger.error(log_message)
-                    failed_downloads.append(file_name)
-                    failed_original_links.add(original_link)
+                    failed_downloads_count += 1
+                    global_failed_original_links.add(original_link)
                 
-                download_summary_data.append({
+                global_download_summary_data.append({
                     'file_id': file_id_for_log,
                     'filename': file_name,
                     'status': status,
@@ -590,74 +857,70 @@ def main():
                     'sha256_hash': sha256_hash_result if sha256_hash_result else 'N/A'
                 })
             except KeyboardInterrupt:
-                logger.warning("KeyboardInterrupt detected. Stopping sequential downloads.")
-                failed_original_links.add(original_link) # Add current link to failed
-                break # Exit the loop
+                logger.warning("KeyboardInterrupt detectado. Deteniendo descargas secuenciales.")
+                global_failed_original_links.add(original_link)
+                break # Salir del bucle
             except Exception as exc:
-                logger.critical(f"Sequential download task for {file_id_for_log} (Link: {original_link}) generated an exception: {exc}", exc_info=True)
-                failed_downloads.append(file_id_for_log) # Use file_id as file_name might not be set yet
-                failed_original_links.add(original_link)
-                download_summary_data.append({
+                logger.critical(f"La tarea de descarga secuencial para {file_id_for_log} (Enlace: {original_link}) generó una excepción: {exc}", exc_info=True)
+                failed_downloads_count += 1
+                global_failed_original_links.add(original_link)
+                global_download_summary_data.append({
                     'file_id': file_id_for_log,
                     'filename': 'N/A',
-                    'status': 'Failed (Exception)',
+                    'status': 'Fallo (Excepción)',
                     'size_bytes': 0,
-                    'duration_seconds': round(time.time() - download_start_time, 2),
+                    'duration_seconds': round(time.time() - start_total_process_time, 2),
                     'sha256_hash': 'N/A'
                 })
 
-    logger.info(f"\n--- Download Summary ---")
-    logger.info(f"Total downloads attempted: {len(download_tasks)}")
-    logger.info(f"Completed downloads: {len(completed_downloads)}")
-    for f_name in completed_downloads:
-        logger.info(f"  - {f_name}")
-    logger.info(f"Failed downloads: {len(failed_downloads)}")
-    for f_name in failed_downloads:
-        logger.error(f"  - {f_name}")
+    logger.info(f"\n--- Resumen de Descargas ---")
+    logger.info(f"Total de descargas intentadas: {len(download_tasks)}")
+    logger.info(f"Descargas completadas: {completed_downloads_count}")
+    logger.info(f"Descargas fallidas: {failed_downloads_count}")
 
-    # --- Generate Download Summary File (CSV) ---
-    if download_summary_data:
+    # --- Generar archivo de resumen de descarga (CSV) ---
+    if global_download_summary_data:
         summary_csv_path = os.path.join(DOWNLOAD_FOLDER, "download_summary.csv")
         try:
             with open(summary_csv_path, 'w', newline='', encoding='utf-8') as csvfile:
                 fieldnames = ['file_id', 'filename', 'status', 'size_bytes', 'duration_seconds', 'sha256_hash']
                 writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
                 writer.writeheader()
-                writer.writerows(download_summary_data)
-            logger.info(f"Download summary saved to: '{os.path.abspath(summary_csv_path)}'")
+                writer.writerows(global_download_summary_data)
+            logger.info(f"Resumen de descargas guardado en: '{os.path.abspath(summary_csv_path)}'")
         except Exception as e:
-            logger.error(f"Error saving download summary to CSV: {e}")
+            logger.error(f"Error al guardar el resumen de descargas en CSV: {e}")
 
     # 🔧 Mejora 4: Generar resumen en JSON
-    if download_summary_data:
+    if global_download_summary_data:
         summary_json_path = os.path.join(DOWNLOAD_FOLDER, "download_summary.json")
         try:
             with open(summary_json_path, 'w', encoding='utf-8') as jsonfile:
-                json.dump(download_summary_data, jsonfile, indent=4, ensure_ascii=False)
+                json.dump(global_download_summary_data, jsonfile, indent=4, ensure_ascii=False)
             logger.info(f"Resumen de descargas guardado en JSON: '{os.path.abspath(summary_json_path)}'")
         except Exception as e:
             logger.error(f"Error al guardar el resumen de descargas en JSON: {e}")
 
-    # --- Save Failed Links to a Separate File ---
-    if failed_original_links:
+    # --- Guardar enlaces fallidos en un archivo separado ---
+    if global_failed_original_links:
         failed_links_path = os.path.join(DOWNLOAD_FOLDER, "failed_downloads.txt")
         try:
             with open(failed_links_path, 'w', encoding='utf-8') as f:
-                for link in sorted(list(failed_original_links)): # Sort for consistent output
+                for link in sorted(list(global_failed_original_links)):
                     f.write(link + "\n")
-            logger.info(f"Failed download links saved to: '{os.path.abspath(failed_links_path)}'")
+            logger.info(f"Enlaces de descarga fallidos guardados en: '{os.path.abspath(failed_links_path)}'")
         except Exception as e:
-            logger.error(f"Error saving failed download links: {e}")
+            logger.error(f"Error al guardar los enlaces de descarga fallidos: {e}")
 
     if PSUTIL_AVAILABLE:
         process = psutil.Process(os.getpid())
         peak_memory_usage_bytes = process.memory_info().rss
-        logger.info(f"Peak memory usage: {peak_memory_usage_bytes / (1024**2):.2f} MB")
+        logger.info(f"Uso máximo de memoria: {peak_memory_usage_bytes / (1024**2):.2f} MB")
 
-    end_total_process_time = time.time() # End total process timer
+    end_total_process_time = time.time()
     total_duration_seconds = end_total_process_time - start_total_process_time
-    logger.info(f"\nTotal process time: {total_duration_seconds:.2f} seconds.")
-    logger.info(f"\nDownload process finished. Check the log at: '{os.path.abspath(log_file_path)}'")
+    logger.info(f"\nTiempo total del proceso: {total_duration_seconds:.2f} segundos.")
+    logger.info(f"\nProceso de descarga finalizado. Revisa el registro en: '{os.path.abspath(log_file_path)}'")
 
 if __name__ == "__main__":
     main()
